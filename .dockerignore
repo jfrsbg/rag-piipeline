@@ -1,0 +1,11 @@
+.git
+.gitignore
+cache/
+inbox/
+models/
+*.md
+__pycache__/
+*.pyc
+.venv/
+venv/
+.env

@@ -1,0 +1,60 @@
+# The two steps are `run` services, not `up` services: they are batch jobs that
+# exit, and running them separately is the whole point of the split.
+#
+#   docker compose up -d db
+#   docker compose run --rm parse /data/inbox
+#   docker compose run --rm index
+#
+# Anything after the service name is appended to the step's own arguments, so
+# `docker compose run --rm index --tables-only <sha>` works as written.
+
+x-app: &app
+  build:
+    context: .
+  environment:
+    RAG_CACHE_DIR: /cache/parsed
+    RAG_PARSER_VERSION: ${RAG_PARSER_VERSION:-docling-2.118}
+    RAG_EMBED_PROFILE: ${RAG_EMBED_PROFILE:-bge-m3}
+    RAG_DSN: postgresql://postgres:postgres@db:5432/docs
+    HF_HOME: /models
+  volumes:
+    - ./cache:/cache
+    - ./inbox:/data/inbox:ro
+    - hf-models:/models
+
+services:
+  db:
+    image: pgvector/pgvector:pg17
+    environment:
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: docs
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      # Runs once, on an empty data directory only.
+      - ./sql/schema.sql:/docker-entrypoint-initdb.d/schema.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d docs"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # Step 1 — parse and cache. No database dependency by design.
+  parse:
+    <<: *app
+    entrypoint: ["python", "step1_parse.py"]
+    command: ["/data/inbox"]
+
+  # Step 2 — extract and store. Waits for the database to accept connections.
+  index:
+    <<: *app
+    entrypoint: ["python", "step2_index.py"]
+    command: []
+    depends_on:
+      db:
+        condition: service_healthy
+
+volumes:
+  pgdata:
+  hf-models:

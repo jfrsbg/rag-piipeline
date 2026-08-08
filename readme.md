@@ -1,178 +1,257 @@
-# pipeline.py
+# rag-embeddings
 
-Parses documents once, caches the parse, and fans the result out to two sinks: tables into relational columns, everything else into chunk embeddings. Both writes land in a single transaction.
+Parses documents once, caches the parse, and fans the result out to two sinks:
+tables into relational columns, everything else into chunk embeddings. Both
+writes land in a single transaction.
 
 ```
-object storage ──► parse ──► cache/parsed/{sha}.json
-                                  │
-                    ┌─────────────┴─────────────┐
-                    ▼                           ▼
-              doc.tables                  chunker.chunk()
-                    │                           │
-                    ▼                           ▼
-              doc_tables                  chunks + embeddings
-                    └───────── one commit ──────┘
+                    ── step 1 ──────────────┐  ── step 2 ─────────────────────
+                                            │
+object storage ──► parse ──► cache/parsed/{sha}.json + {sha}.meta.json
+                                            │       │
+                                            │  ┌────┴──────────┐
+                                            │  ▼               ▼
+                                            │ doc.tables   chunker.chunk()
+                                            │  │               │
+                                            │  ▼               ▼
+                                            │ doc_tables   chunks + embeddings
+                                            │  └──── one commit ────┘
 ```
+
+The two steps run as separate processes. Step 1 needs Docling and a disk; step 2
+needs a GPU-ish machine and the database. Neither needs what the other has.
 
 ---
 
-## Install
+## Layout
+
+```
+step1_parse.py               entrypoint: parse and cache
+step2_index.py               entrypoint: extract and store
+rag_embeddings/
+  config.py                  env -> Settings, the only place os.environ is read
+  profiles.py                EmbedProfile + the named profiles
+  embedder.py                tokenizer, chunker and model, from one profile
+  cache.py                   parse cache and the manifest sidecar
+  cli.py                     flags shared by both steps
+  extraction/
+    tables.py                branch A: tables -> relational rows
+    chunks.py                branch B: chunks -> vectors
+  storage/
+    connection.py            connect() + register_vector
+    sql.py                   every statement, in one place
+    writer.py                write_all(): both branches, one commit
+  steps/
+    parse.py                 step 1
+    index.py                 step 2
+  pipeline.py                ingest / reextract / rechunk, for in-process use
+sql/schema.sql               applied by the db container on first start
+tests/test_wiring.py         both steps end to end, no torch, no database
+```
+
+Each entrypoint file does nothing but call `main()` in its step module, so the
+container invocation and the importable function never drift apart.
+
+---
+
+## Run it with Docker
 
 ```bash
-pip install docling docling-core sentence-transformers transformers \
-            psycopg[binary] pgvector
+docker compose up -d db                      # postgres + pgvector, schema applied
+docker compose run --rm parse /data/inbox    # step 1
+docker compose run --rm index                # step 2
 ```
 
-First run downloads the Docling layout models and the embedding model (~2 GB for BGE-M3). CPU works; a GPU makes the initial backfill hours instead of days.
+`./inbox` is mounted read-only at `/data/inbox` and `./cache` holds the parse
+cache, so both steps see the same files you do. Model weights land in a named
+volume — a rebuild does not re-download BGE-M3.
+
+Arguments after the service name go to the step:
+
+```bash
+docker compose run --rm parse /data/inbox --pattern '*.pdf' --force
+docker compose run --rm index --tables-only 9f2a...c1
+docker compose run --rm index --stale
+```
+
+Without compose:
+
+```bash
+docker build -t rag-embeddings .
+docker run --rm -v ./cache:/cache -v ./inbox:/data/inbox:ro \
+  rag-embeddings step1_parse.py /data/inbox
+docker run --rm -v ./cache:/cache -v hf-models:/models \
+  -e RAG_DSN=postgresql://user:pass@host/docs \
+  rag-embeddings step2_index.py
+```
+
+The image installs the CPU torch wheel by default. For a GPU host:
+`docker build --build-arg TORCH_INDEX_URL=https://download.pytorch.org/whl/cu126 .`
 
 ---
 
-## Database setup
+## Run it locally
 
-The module assumes these tables exist. Run once:
-
-```sql
-create extension if not exists vector;
-
-create table documents (
-  id             bigserial primary key,
-  sha256         text unique not null,
-  uri            text not null,
-  mime           text,
-  parser_version text,
-  parsed_at      timestamptz,
-  status         text default 'pending'
-);
-
-create table doc_tables (
-  id             bigserial primary key,
-  document_id    bigint not null references documents(id) on delete cascade,
-  table_index    int not null,
-  self_ref       text not null,          -- '#/tables/0' — join key to chunks
-  page           int,
-  caption        text,
-  num_rows       int,
-  num_cols       int,
-  columns        jsonb,                  -- header cell texts
-  cells          jsonb,                  -- full grid with row/col offsets
-  markdown       text,
-  parser_version text,
-  unique (document_id, table_index)
-);
-
-create table chunks (
-  id           bigserial primary key,
-  document_id  bigint not null references documents(id) on delete cascade,
-  ord          int not null,
-  text         text not null,
-  heading_path text[],
-  page         int,
-  refs         jsonb,                    -- self_refs of the items serialized
-  embedding    vector(1024),
-  embed_model  text not null,
-  chunk_config text not null,
-  token_count  int,
-  unique (document_id, ord)
-);
-
-create index on chunks (document_id, ord);          -- windowed reads
-create index on chunks using hnsw (embedding vector_cosine_ops);
-create index on doc_tables (document_id);
+```bash
+pip install -r requirements.txt         # or: pip install -e .
+python step1_parse.py inbox/
+python step2_index.py --dsn postgresql://localhost/docs
 ```
 
-`vector(1024)` matches BGE-M3. Change it if you change models — and note that altering the dimension requires dropping and rebuilding the column.
+First run downloads the Docling layout models and the embedding model (~2 GB for
+BGE-M3). CPU works; a GPU makes the initial backfill hours instead of days.
 
-Before building the HNSW index on a large table, raise `maintenance_work_mem` (1–2 GB) or the build will take far longer than it should.
+`pip install -e .` also puts `rag-parse` and `rag-index` on your PATH — the same
+two `main()` functions.
 
 ---
 
 ## Configuration
 
-Everything model-related lives in one frozen dataclass. The tokenizer, the chunker, and the embedder are all derived from it, so a mismatch between chunk sizing and embedding capacity requires constructing two profiles — which shows up in a diff.
+Every knob is a CLI flag with an environment-variable default, resolved once in
+`config.py`. Flags beat the environment; the environment beats the defaults.
+
+| Env var | Flag | Default |
+|---|---|---|
+| `RAG_CACHE_DIR` | `--cache-dir` | `cache/parsed` |
+| `RAG_PARSER_VERSION` | `--parser-version` | `docling-2.118` |
+| `RAG_DSN` (or `DATABASE_URL`) | `--dsn` | `postgresql://localhost/docs` |
+| `RAG_EMBED_PROFILE` | `--profile` | `bge-m3` |
+| `RAG_EMBED_MAX_TOKENS` | `--max-tokens` | from the profile |
+| `RAG_EMBED_HEADROOM` | `--headroom` | `128` |
+
+Everything model-related still lives in one frozen dataclass. The tokenizer, the
+chunker, and the embedder are all derived from it, so a mismatch between chunk
+sizing and embedding capacity requires constructing two profiles — which shows
+up in a diff.
 
 ```python
-from pipeline import EmbedProfile, Embedder, connect
+from rag_embeddings import EmbedProfile, Embedder
 
 BGE_M3 = EmbedProfile(model_id="BAAI/bge-m3", max_tokens=8192)
-
-emb  = Embedder(BGE_M3)
-conn = connect("postgresql://localhost/docs")
 ```
 
-For E5-family models, set the prefixes — omitting them degrades retrieval quietly rather than loudly:
+`--profile` takes a name from `profiles.py` (`bge-m3`, `e5-large`) or any
+HuggingFace model id, in which case `--max-tokens` is required — there is no
+safe default to guess. E5-family models need their prefixes; omitting them
+degrades retrieval quietly rather than loudly, which is why `e5-large` is a named
+profile rather than a flag you have to remember.
 
-```python
-E5 = EmbedProfile(
-    model_id="intfloat/multilingual-e5-large",
-    max_tokens=512,
-    passage_prefix="passage: ",
-    query_prefix="query: ",
-)
-```
+`max_tokens` comes from the model card, deliberately not from
+`tokenizer.model_max_length` — many HF configs ship a sentinel in the range of
+10^19 there, and feeding that to the chunker means it never splits anything.
 
-`max_tokens` comes from the model card, deliberately not from `tokenizer.model_max_length` — many HF configs ship a sentinel in the range of 10^19 there, and feeding that to the chunker means it never splits anything.
-
-`headroom` (default 128) sizes the chunker below the real limit because `contextualize()` prepends the heading path *after* the split decision was made.
-
-Also set `PARSER_VERSION` and `CACHE_DIR` at the top of the module to match your environment.
+`headroom` (default 128) sizes the chunker below the real limit because
+`contextualize()` prepends the heading path *after* the split decision was made.
 
 ---
 
-## Ingesting
+## Step 1 — parse and cache
+
+```bash
+python step1_parse.py inbox/                      # a directory
+python step1_parse.py inbox/ --pattern '*.pdf'    # filtered
+python step1_parse.py a.pdf b.pdf 'reports/*.docx'
+python step1_parse.py inbox/ --force              # after a Docling upgrade
+```
+
+Writes two files per document: `{sha}.json` (the parse) and `{sha}.meta.json`
+(uri, mime, parser version, timestamp). Prints `sha<TAB>uri` per document, so it
+pipes.
+
+The manifest exists because the steps are separate processes. Step 2 only gets a
+sha; rather than have it re-derive the uri from a source that may no longer be
+reachable, step 1 records what it knew at parse time.
+
+Content-addressed and idempotent: re-running over the same bytes is a cache hit,
+so a crashed batch restarts from the top without duplicates or cleanup.
+
+For object storage, stage the bytes to disk and keep the real location:
+
+```bash
+aws s3 sync s3://bucket/prefix ./inbox
+python step1_parse.py inbox/ --uri-prefix s3://bucket/prefix
+```
+
+That is what ends up in `documents.uri`, while Docling opens the local file.
+
+---
+
+## Step 2 — extract and store
+
+```bash
+python step2_index.py                    # everything in the cache
+python step2_index.py 9f2a...c1 4b81...0e
+python step2_index.py --skip-existing    # only what isn't in the database yet
+```
+
+Loads each cached parse, runs both branches, and writes them in one transaction
+per document. No parser runs here.
+
+The branch flags are the reprocessing triggers, and they are why the two
+branches are separate code paths at all:
+
+| Changed | Run | Re-parses? | Loads a model? |
+|---|---|---|---|
+| Extraction logic / table schema | `step2_index.py --tables-only` | no | no |
+| Embedding model, `max_tokens`, chunker | `step2_index.py --chunks-only` | no | yes |
+| Docling version, OCR settings | `step1_parse.py --force` then step 2 | yes | yes |
+
+After changing the profile, find exactly what is stale rather than reprocessing
+everything:
+
+```bash
+python step2_index.py --stale --chunks-only --profile bge-m3 --max-tokens 2048
+```
+
+`--stale` compares each chunk's stored `chunk_config` against the active profile
+version, so it catches model swaps and token-limit changes alike.
+
+---
+
+## Using it as a library
+
+`pipeline.py` keeps the original in-process entry points for callers that want
+parse and store in one go — `ingest` is step 1 followed by step 2:
 
 ```python
 from pathlib import Path
+from rag_embeddings import Embedder, Settings, connect, ingest, rechunk, stale_documents
+
+settings = Settings.from_env()
+emb = Embedder(settings.profile)
+conn = connect(settings.dsn)
 
 for path in Path("inbox").glob("*.pdf"):
-    sha = ingest(conn, str(path), path.read_bytes(),
-                 mime="application/pdf", emb=emb)
-```
-
-`ingest()` is idempotent by content hash — re-running over the same file is a no-op, so a crashed batch can be restarted from the top without duplicates or cleanup.
-
-From object storage rather than local disk:
-
-```python
-blob = s3.get_object(Bucket=bucket, Key=key)["Body"].read()
-sha = ingest(conn, f"s3://{bucket}/{key}", blob, mime="application/pdf", emb=emb)
-```
-
-Note that `parse_and_cache` passes `uri` to Docling's converter. For remote objects, write the bytes to a temp file first and pass that path, keeping the s3 URI as the `uri` recorded in `documents`.
-
----
-
-## Reprocessing
-
-The three entry points exist because the branches have different reprocessing triggers. All three read the same cache; only `ingest` ever touches a parser.
-
-| Changed | Run | Re-parses? |
-|---|---|---|
-| Extraction logic / table schema | `reextract(conn, sha)` | no |
-| Embedding model, `max_tokens`, chunker | `rechunk(conn, sha, emb)` | no |
-| Docling version, OCR settings | `ingest(...)` again | yes |
-
-After changing the profile, find exactly what's stale rather than reprocessing everything:
-
-```python
-emb = Embedder(EmbedProfile("BAAI/bge-m3", max_tokens=2048))   # was 8192
+    ingest(conn, str(path), path.read_bytes(), mime="application/pdf", emb=emb)
 
 for sha in stale_documents(conn, emb):
     rechunk(conn, sha, emb)
 ```
 
-`stale_documents()` compares each chunk's stored `chunk_config` against the active profile version, so it catches model swaps and token-limit changes alike.
+---
 
-To force a re-parse (Docling upgrade, better table model), delete the cache entries and re-ingest:
+## Database setup
+
+`sql/schema.sql` holds the DDL; the `db` service applies it on first start of an
+empty data directory. Applying it by hand:
 
 ```bash
-rm cache/parsed/{sha}.json
+psql postgresql://localhost/docs -f sql/schema.sql
 ```
+
+`vector(1024)` matches BGE-M3. Change it if you change models — and note that
+altering the dimension requires dropping and rebuilding the column.
+
+Before building the HNSW index on a large table, raise `maintenance_work_mem`
+(1–2 GB) or the build will take far longer than it should.
 
 ---
 
 ## Querying
 
-**Semantic search.** Embed the query through the same profile — same model, same normalization, same prefix:
+**Semantic search.** Embed the query through the same profile — same model, same
+normalization, same prefix:
 
 ```python
 qvec = emb.encode_query("what were the Q3 logistics costs?")
@@ -184,7 +263,8 @@ rows = conn.execute(
 ).fetchall()
 ```
 
-**Widen the context after retrieval.** Chunks are stored without overlap; the neighbours are one indexed lookup away, which is why `ord` exists:
+**Widen the context after retrieval.** Chunks are stored without overlap; the
+neighbours are one indexed lookup away, which is why `ord` exists:
 
 ```python
 window = conn.execute(
@@ -195,7 +275,8 @@ window = conn.execute(
 ).fetchall()
 ```
 
-**Follow a table chunk to its authoritative cells.** A hit whose `refs` contains a table's `self_ref` resolves to the exact grid:
+**Follow a table chunk to its authoritative cells.** A hit whose `refs` contains
+a table's `self_ref` resolves to the exact grid:
 
 ```sql
 select t.cells, t.columns, t.page
@@ -206,30 +287,70 @@ join doc_tables t
 where c.id = %s;
 ```
 
-That's the point of sending tables to both sinks — search finds the readable markdown copy, the application reads the typed values.
+That's the point of sending tables to both sinks — search finds the readable
+markdown copy, the application reads the typed values.
 
 ---
 
 ## Things that will bite you
 
-**Overflow warnings are real.** `build_chunks` logs `chunk overflow` when the contextualized text exceeds the profile limit. It does not truncate or split — it records `token_count` so you can find them later:
+**A missing manifest fails step 2, not step 1.** `{sha}.meta.json` is written
+after the parse. If you copy a cache directory around, copy both files, or step 2
+raises `no manifest for {sha}` — deliberately, rather than inventing a uri.
+
+**Overflow warnings are real.** `build_chunks` logs `chunk overflow` when the
+contextualized text exceeds the profile limit. It does not truncate or split — it
+records `token_count` so you can find them later:
 
 ```sql
 select document_id, ord, token_count from chunks where token_count > 8192;
 ```
 
-If that returns rows, either raise `headroom` or add a hard splitter for those cases. Wide tables and deep heading paths are the usual causes.
+If that returns rows, either raise `headroom` or add a hard splitter for those
+cases. Wide tables and deep heading paths are the usual causes.
 
-**`ord` must stay dense.** It's assigned by `enumerate` over the chunker's output, and the emission order *is* reading order. If you add filtering (dropping empty or boilerplate chunks), filter after assignment or the windowed reads above will silently return short.
+**`ord` must stay dense.** It's assigned by `enumerate` over the chunker's
+output, and the emission order *is* reading order. If you add filtering (dropping
+empty or boilerplate chunks), filter after assignment or the windowed reads above
+will silently return short.
 
-**Table cells, not DataFrames.** `extract_tables` reads `table.data.table_cells` because `export_to_dataframe()` has a known class of bug where a column vanishes from the export while the data sits intact in the JSON. If you need a frame for analysis, build it from `cells` yourself.
+**Table cells, not DataFrames.** `extract_tables` reads `table.data.table_cells`
+because `export_to_dataframe()` has a known class of bug where a column vanishes
+from the export while the data sits intact in the JSON. If you need a frame for
+analysis, build it from `cells` yourself.
 
-**`prov` can be empty.** Merged list groups and some HTML-derived nodes carry no provenance, so `page` will be `null` for them. That's expected, not a failure — don't add a NOT NULL constraint there.
+**`prov` can be empty.** Merged list groups and some HTML-derived nodes carry no
+provenance, so `page` will be `null` for them. That's expected, not a failure —
+don't add a NOT NULL constraint there.
 
-**Both branches delete before insert.** `write_all`, `reextract`, and `rechunk` each clear the document's existing rows first, inside the transaction. Reprocessing is therefore a replace, not an append.
+**Both branches delete before insert.** `write_all`, and therefore every step 2
+run, clears the document's existing rows first, inside the transaction.
+Reprocessing is a replace, not an append.
+
+**Don't pin `transformers` yourself.** `docling-core[chunking]` caps it at `<5.9`
+on macOS and `<6` elsewhere; adding a third opinion is how you get an unsolvable
+resolve on one platform and a silently different version on the other. See the
+comment in `requirements.txt`.
+
+---
+
+## Tests
+
+```bash
+python tests/test_wiring.py
+```
+
+Stubs Docling, sentence-transformers and psycopg, then runs step 1 into a temp
+cache and step 2 out of it, asserting the manifest round-trip, the statement
+order inside the transaction, and that `--tables-only` never loads a model. No
+torch, no database, under a second.
 
 ---
 
 ## Extending
 
-The obvious next stage is the extraction pass — a schema-driven read over the chunks (LangExtract, Instructor) producing typed rows in a `facts` table, plus the entity resolution described in `entity-resolution-design.md`. Both belong as a fourth entry point reading the same cache, for the same reason the other three do: a change to your extraction schema shouldn't cost a re-parse.
+The obvious next stage is the extraction pass — a schema-driven read over the
+chunks (LangExtract, Instructor) producing typed rows in a `facts` table, plus
+the entity resolution described in `entity-resolution-design.md`. It belongs as a
+third step reading the same cache, for the same reason step 2 does: a change to
+your extraction schema shouldn't cost a re-parse.
