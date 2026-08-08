@@ -7,6 +7,18 @@ name = "rag-embeddings"
 version = "0.1.0"
 description = "Parse documents once, cache, fan out to relational tables and vector chunks."
 requires-python = ">=3.10"
+
+# Verified against the released APIs on 2026-08-08.
+#
+# `docling` pulls docling-slim[standard], which already pulls
+# docling-core[chunking] — the extra that makes HybridChunker and
+# HuggingFaceTokenizer importable. It is named explicitly here anyway so a
+# future move to docling-slim does not silently drop the chunker.
+#
+# transformers is deliberately NOT pinned here. docling-core[chunking] caps it
+# at <5.9 on macOS and <6 elsewhere, and sentence-transformers wants >=4.41;
+# adding a third opinion is how you get an unsolvable resolve on one platform
+# and a silently different version on the other.
 dependencies = [
     "docling>=2.118.1,<3",
     "docling-core[chunking]>=2.91.0,<3",
@@ -15,9 +27,50 @@ dependencies = [
     "pgvector>=0.5.0,<1",
 ]
 
+# torch is a transitive dependency of sentence-transformers, but which build of
+# it you get is a deployment decision, not a code one — so it is named here and
+# routed to an index by extra. Exactly one of these must be selected; picking
+# neither resolves torch from PyPI, whose default wheel drags in the whole CUDA
+# stack and triples the image for no benefit on a laptop.
+[project.optional-dependencies]
+cpu = ["torch", "torchvision"]
+cu126 = ["torch", "torchvision"]
+
 [project.scripts]
 rag-parse = "rag_embeddings.steps.parse:main"
 rag-index = "rag_embeddings.steps.index:main"
 
 [tool.setuptools.packages.find]
 include = ["rag_embeddings*"]
+
+# `explicit = true` keeps these indexes from being consulted for anything that
+# is not routed to them below — without it every package in the tree would be
+# looked up on download.pytorch.org first.
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[[tool.uv.index]]
+name = "pytorch-cu126"
+url = "https://download.pytorch.org/whl/cu126"
+explicit = true
+
+[tool.uv]
+# The lock has to hold both builds at once, and they disagree on the version of
+# torch, so uv needs to be told the extras are mutually exclusive rather than
+# trying to satisfy them together.
+conflicts = [[{ extra = "cpu" }, { extra = "cu126" }]]
+
+# The pytorch indexes only carry Linux and Windows wheels; on macOS the PyPI
+# wheel is already CPU-only, so the marker lets the same extra mean "CPU torch"
+# on a laptop and in the image without a second lock.
+[tool.uv.sources]
+torch = [
+    { index = "pytorch-cpu", extra = "cpu", marker = "sys_platform != 'darwin'" },
+    { index = "pytorch-cu126", extra = "cu126" },
+]
+torchvision = [
+    { index = "pytorch-cpu", extra = "cpu", marker = "sys_platform != 'darwin'" },
+    { index = "pytorch-cu126", extra = "cu126" },
+]

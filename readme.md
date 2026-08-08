@@ -4,18 +4,24 @@ Parses documents once, caches the parse, and fans the result out to two sinks:
 tables into relational columns, everything else into chunk embeddings. Both
 writes land in a single transaction.
 
-```
-                    ── step 1 ──────────────┐  ── step 2 ─────────────────────
-                                            │
-object storage ──► parse ──► cache/parsed/{sha}.json + {sha}.meta.json
-                                            │       │
-                                            │  ┌────┴──────────┐
-                                            │  ▼               ▼
-                                            │ doc.tables   chunker.chunk()
-                                            │  │               │
-                                            │  ▼               ▼
-                                            │ doc_tables   chunks + embeddings
-                                            │  └──── one commit ────┘
+```mermaid
+flowchart LR
+    subgraph step1 ["step 1 — parse and cache"]
+        direction LR
+        src[(object storage)] --> parse[parse]
+        parse --> cache["cache/parsed/<br>{sha}.json + {sha}.meta.json"]
+    end
+
+    subgraph step2 ["step 2 — extract and store"]
+        direction LR
+        tables["doc.tables"] --> doc_tables[(doc_tables)]
+        chunk["chunker.chunk()"] --> chunks[(chunks + embeddings)]
+        doc_tables -.-> commit(["one commit"])
+        chunks -.-> commit
+    end
+
+    cache --> tables
+    cache --> chunk
 ```
 
 The two steps run as separate processes. Step 1 needs Docling and a disk; step 2
@@ -86,23 +92,40 @@ docker run --rm -v ./cache:/cache -v hf-models:/models \
 ```
 
 The image installs the CPU torch wheel by default. For a GPU host:
-`docker build --build-arg TORCH_INDEX_URL=https://download.pytorch.org/whl/cu126 .`
+`docker build --build-arg TORCH_EXTRA=cu126 .`
+
+Rebuilds are cheap in two ways worth knowing about. The dependency layer is
+keyed on `pyproject.toml` + `uv.lock` only, so editing a runtime setting or any
+source file does not touch it; and when the lock *does* change, the wheels come
+from a BuildKit cache mount instead of the network. That cache lives outside the
+image — `docker builder prune` is what clears it, and a cold CI runner has no
+such cache and will download the full ~2 GB.
+
+Model weights are a separate cache: they live on the `hf-models` volume, not in
+the image, so they survive rebuilds but not `docker compose down -v`. To bake
+them in instead — for CI, an air-gapped host, or an image you ship to someone
+else — build with `--build-arg PREFETCH_MODELS=1`. That adds ~2.6 GB to the
+image, and is redundant locally where the volume already holds them.
 
 ---
 
 ## Run it locally
 
 ```bash
-pip install -r requirements.txt         # or: pip install -e .
-python step1_parse.py inbox/
-python step2_index.py --dsn postgresql://localhost/docs
+uv sync --extra cpu                     # or --extra cu126 on a GPU host
+uv run step1_parse.py inbox/
+uv run step2_index.py --dsn postgresql://localhost/docs
 ```
 
 First run downloads the Docling layout models and the embedding model (~2 GB for
 BGE-M3). CPU works; a GPU makes the initial backfill hours instead of days.
 
-`pip install -e .` also puts `rag-parse` and `rag-index` on your PATH — the same
-two `main()` functions.
+`uv sync` also puts `rag-parse` and `rag-index` in `.venv/bin` — the same two
+`main()` functions the step files call.
+
+`uv.lock` is committed and is the single source of truth for versions; the
+`cpu` and `cu126` extras are declared conflicting, so exactly one may be
+selected. There is no `requirements.txt` — `pyproject.toml` replaced it.
 
 ---
 
@@ -330,7 +353,7 @@ Reprocessing is a replace, not an append.
 **Don't pin `transformers` yourself.** `docling-core[chunking]` caps it at `<5.9`
 on macOS and `<6` elsewhere; adding a third opinion is how you get an unsolvable
 resolve on one platform and a silently different version on the other. See the
-comment in `requirements.txt`.
+comment on `dependencies` in `pyproject.toml`.
 
 ---
 
