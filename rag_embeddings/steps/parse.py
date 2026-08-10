@@ -14,7 +14,7 @@ import mimetypes
 from pathlib import Path
 from typing import Iterable, Sequence
 
-from ..cache import Manifest, cache_path, manifest_path, parse_and_cache, sha256_of
+from ..cache import Manifest, drop_cached, parse_and_cache, sha256_of
 from ..cli import common_parser, configure_logging, settings_from
 from ..config import Settings
 
@@ -77,9 +77,7 @@ def parse_documents(
         uri = f"{uri_prefix.rstrip('/')}/{path.name}" if uri_prefix else str(path)
 
         if force:
-            digest = sha256_of(blob)
-            cache_path(digest, settings.cache_dir).unlink(missing_ok=True)
-            manifest_path(digest, settings.cache_dir).unlink(missing_ok=True)
+            drop_cached(sha256_of(blob), settings.cache_dir)
 
         sha, _doc = parse_and_cache(uri, blob, settings.cache_dir, source=str(path))
         manifest = Manifest.now(

@@ -4,6 +4,7 @@ __pycache__/
 venv/
 .env
 cache/
+queue/
 inbox/
 models/
 *.egg-info/

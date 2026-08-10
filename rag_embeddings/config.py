@@ -20,6 +20,9 @@ DEFAULT_CACHE_DIR = "cache/parsed"
 DEFAULT_PARSER_VERSION = "docling-2.118"
 DEFAULT_PROFILE = "bge-m3"
 DEFAULT_DSN = "postgresql://localhost/docs"
+DEFAULT_QUEUE_URL = "file://./queue"
+DEFAULT_PARSE_QUEUE = "to-parse"
+DEFAULT_INDEX_QUEUE = "to-index"
 
 
 def _int_env(name: str) -> int | None:
@@ -33,6 +36,10 @@ class Settings:
     parser_version: str
     dsn: str
     profile: EmbedProfile
+    # Only the workers read these; the two batch steps ignore them entirely.
+    queue_url: str = DEFAULT_QUEUE_URL
+    parse_queue: str = DEFAULT_PARSE_QUEUE
+    index_queue: str = DEFAULT_INDEX_QUEUE
 
     @classmethod
     def from_env(
@@ -44,6 +51,9 @@ class Settings:
         profile: str | None = None,
         max_tokens: int | None = None,
         headroom: int | None = None,
+        queue_url: str | None = None,
+        parse_queue: str | None = None,
+        index_queue: str | None = None,
     ) -> "Settings":
         """Build settings from the environment, with optional overrides.
 
@@ -78,5 +88,18 @@ class Settings:
                     if headroom is not None
                     else _int_env("RAG_EMBED_HEADROOM")
                 ),
+            ),
+            queue_url=(
+                queue_url or os.environ.get("RAG_QUEUE_URL") or DEFAULT_QUEUE_URL
+            ),
+            parse_queue=(
+                parse_queue
+                or os.environ.get("RAG_PARSE_QUEUE")
+                or DEFAULT_PARSE_QUEUE
+            ),
+            index_queue=(
+                index_queue
+                or os.environ.get("RAG_INDEX_QUEUE")
+                or DEFAULT_INDEX_QUEUE
             ),
         )

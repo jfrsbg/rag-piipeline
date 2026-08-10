@@ -200,9 +200,14 @@ stub("pgvector.psycopg", register_vector=lambda conn: None)
 sys.path.insert(0, str(ROOT))
 
 import rag_embeddings                                        # noqa: E402
-from rag_embeddings.profiles import resolve                   # noqa: E402
-from rag_embeddings.steps.index import main as index_main     # noqa: E402
-from rag_embeddings.steps.parse import main as parse_main     # noqa: E402
+from rag_embeddings.cache import Manifest, cached_shas         # noqa: E402
+from rag_embeddings.config import Settings                     # noqa: E402
+from rag_embeddings.profiles import resolve                    # noqa: E402
+from rag_embeddings.queues import IndexRequest, open_queue     # noqa: E402
+from rag_embeddings.steps.index import main as index_main      # noqa: E402
+from rag_embeddings.steps.parse import main as parse_main      # noqa: E402
+from rag_embeddings.workers import enqueue as producer         # noqa: E402
+from rag_embeddings.workers import index_worker, parse_worker  # noqa: E402
 
 
 def check(work: Path) -> None:
@@ -274,7 +279,83 @@ def check(work: Path) -> None:
     assert FakeTokenizer.seen[0] == ("BAAI/bge-m3", 8192 - 128)
 
 
+def check_workers(work: Path) -> None:
+    """The same two steps over a queue: producer -> parse -> index -> SQL.
+
+    Runs both workers in this process against a file-backed queue, which is
+    the arrangement compose uses — only the container boundary is missing.
+    """
+    inbox, cache, queue_root = work / "inbox", work / "cache", work / "queue"
+    inbox.mkdir()
+    for i in range(3):
+        (inbox / f"doc{i}.pdf").write_bytes(f"%PDF-1.4 doc {i}".encode())
+
+    settings = Settings.from_env(
+        cache_dir=str(cache),
+        parser_version="w",
+        dsn="x",
+        queue_url=f"file://{queue_root}",
+    )
+    to_parse = open_queue(settings.queue_url, settings.parse_queue)
+    to_index = open_queue(settings.queue_url, settings.index_queue)
+
+    # -- producer ----------------------------------------------------------
+    assert len(producer.enqueue_files([str(inbox)], settings)) == 3
+    assert to_parse.depth() == 3, "producer published one message per document"
+
+    # -- step 1 workers ----------------------------------------------------
+    # Two of them, sharing the queue with no coordination, exactly as two pods
+    # sharing a volume would. idle_timeout=0 is what makes them exit.
+    first = parse_worker.run(settings, idle_timeout=0.0)
+    second = parse_worker.run(settings, idle_timeout=0.0)
+    assert first.acked + second.acked == 3, "documents were lost or duplicated"
+    assert second.received == 0, "the drained queue handed out a message twice"
+    assert to_parse.depth() == 0
+    assert to_index.depth() == 3, "parses were not announced downstream"
+
+    # The manifest rides on the message; step 2 never has to read the sidecar.
+    peeked = IndexRequest.from_body(to_index.receive().body)
+    assert peeked.parser_version == "w" and peeked.mime == "application/pdf"
+    assert peeked.to_manifest() == Manifest.read(peeked.sha256, cache)
+
+    # -- step 2 worker -----------------------------------------------------
+    CONN.log.clear()
+    loaded = len(FakeModel.loaded)
+    stats = index_worker.run(settings, conn=CONN, idle_timeout=0.0)
+
+    assert stats.acked == 2, stats            # one was consumed by the peek above
+    assert len(FakeModel.loaded) == loaded + 1, (
+        "the model was loaded per message; it must be loaded per worker"
+    )
+    order = [q for q, _ in CONN.log]
+    assert order.count("BEGIN") == order.count("COMMIT") == 2, "one commit per doc"
+    assert any(q.startswith("insert into doc_tables") for q in order)
+    assert any(q.startswith("insert into chunks") for q in order)
+
+    # -- a poison message must not take the worker down --------------------
+    to_index.publish(
+        IndexRequest(
+            sha256="0" * 64, uri="gone.pdf", mime="application/pdf",
+            parser_version="w", parsed_at="2026-08-08T00:00:00+00:00",
+        ).to_body()
+    )
+    to_index.publish(peeked.to_body())                     # a good one behind it
+
+    stats = index_worker.run(settings, conn=CONN, idle_timeout=0.0, max_attempts=2)
+    assert stats.dead_lettered == 1, "the missing parse was retried forever"
+    assert stats.acked == 1, "the good document behind it never ran"
+    assert to_index.depth() == 0
+
+    # -- re-enqueueing from the cache is a coordinator job, not a worker's --
+    assert sorted(producer.enqueue_cached(None, settings, queue=to_index)) == sorted(
+        cached_shas(cache)
+    )
+    assert to_index.depth() == 3
+
+
 if __name__ == "__main__":
     with tempfile.TemporaryDirectory() as tmp:
         check(Path(tmp))
+    with tempfile.TemporaryDirectory() as tmp:
+        check_workers(Path(tmp))
     print("wiring ok")

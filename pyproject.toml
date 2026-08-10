@@ -39,6 +39,10 @@ cu126 = ["torch", "torchvision"]
 [project.scripts]
 rag-parse = "rag_embeddings.steps.parse:main"
 rag-index = "rag_embeddings.steps.index:main"
+# The same two steps, one document per message. See rag_embeddings/workers.
+rag-enqueue = "rag_embeddings.workers.enqueue:main"
+rag-parse-worker = "rag_embeddings.workers.parse_worker:main"
+rag-index-worker = "rag_embeddings.workers.index_worker:main"
 
 [tool.setuptools.packages.find]
 include = ["rag_embeddings*"]

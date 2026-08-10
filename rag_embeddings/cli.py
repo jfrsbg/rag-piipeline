@@ -11,6 +11,9 @@ import argparse
 import logging
 
 from .config import Settings
+# From `base` rather than the package, so importing the argument plumbing does
+# not drag in a backend — or, through the message types, docling.
+from .queues.base import DEFAULT_MAX_ATTEMPTS, DEFAULT_VISIBILITY_TIMEOUT
 
 
 def common_parser() -> argparse.ArgumentParser:
@@ -38,6 +41,48 @@ def add_db_args(parser: argparse.ArgumentParser) -> None:
     group.add_argument("--dsn", help="postgres connection string [RAG_DSN]")
 
 
+def add_queue_args(parser: argparse.ArgumentParser) -> None:
+    """Only the workers and the producer speak to a queue."""
+    group = parser.add_argument_group("queue")
+    group.add_argument(
+        "--queue-url",
+        help="backend: file://<dir> or memory:// [RAG_QUEUE_URL]",
+    )
+    group.add_argument("--parse-queue", help="step 1's queue [RAG_PARSE_QUEUE]")
+    group.add_argument("--index-queue", help="step 2's queue [RAG_INDEX_QUEUE]")
+
+
+def add_worker_args(parser: argparse.ArgumentParser) -> None:
+    """The knobs that decide when a worker container exits."""
+    group = parser.add_argument_group("worker loop")
+    group.add_argument(
+        "--idle-timeout",
+        type=float,
+        default=None,
+        help="seconds to wait on an empty queue before exiting; omit to run "
+             "forever, which is what a Deployment wants",
+    )
+    group.add_argument(
+        "--max-messages",
+        type=int,
+        default=None,
+        help="handle at most this many, then exit",
+    )
+    group.add_argument(
+        "--max-attempts",
+        type=int,
+        default=DEFAULT_MAX_ATTEMPTS,
+        help="deliveries before a message is dead-lettered (default: %(default)s)",
+    )
+    group.add_argument(
+        "--visibility-timeout",
+        type=float,
+        default=DEFAULT_VISIBILITY_TIMEOUT,
+        help="seconds before a claim held by a dead worker is reclaimed "
+             "(default: %(default)s)",
+    )
+
+
 def settings_from(args: argparse.Namespace) -> Settings:
     return Settings.from_env(
         cache_dir=getattr(args, "cache_dir", None),
@@ -46,6 +91,9 @@ def settings_from(args: argparse.Namespace) -> Settings:
         profile=getattr(args, "profile", None),
         max_tokens=getattr(args, "max_tokens", None),
         headroom=getattr(args, "headroom", None),
+        queue_url=getattr(args, "queue_url", None),
+        parse_queue=getattr(args, "parse_queue", None),
+        index_queue=getattr(args, "index_queue", None),
     )
 
 

@@ -27,6 +27,10 @@ flowchart LR
 The two steps run as separate processes. Step 1 needs Docling and a disk; step 2
 needs a GPU-ish machine and the database. Neither needs what the other has.
 
+That split is also the fan-out boundary: the same two steps run as pools of
+queue workers, one document per message, without changing what the diagram
+above describes. See [Running it in parallel](#running-it-in-parallel).
+
 ---
 
 ## Layout
@@ -34,12 +38,16 @@ needs a GPU-ish machine and the database. Neither needs what the other has.
 ```
 step1_parse.py               entrypoint: parse and cache
 step2_index.py               entrypoint: extract and store
+enqueue.py                   entrypoint: publish work onto a queue
+worker_parse.py              entrypoint: step 1 as a queue consumer
+worker_index.py              entrypoint: step 2 as a queue consumer
 rag_embeddings/
   config.py                  env -> Settings, the only place os.environ is read
   profiles.py                EmbedProfile + the named profiles
   embedder.py                tokenizer, chunker and model, from one profile
+  blobstore.py               where the cache lives: local now, object store later
   cache.py                   parse cache and the manifest sidecar
-  cli.py                     flags shared by both steps
+  cli.py                     flags shared by the steps and the workers
   extraction/
     tables.py                branch A: tables -> relational rows
     chunks.py                branch B: chunks -> vectors
@@ -48,15 +56,31 @@ rag_embeddings/
     sql.py                   every statement, in one place
     writer.py                write_all(): both branches, one commit
   steps/
-    parse.py                 step 1
-    index.py                 step 2
+    parse.py                 step 1, batch over a directory
+    index.py                 step 2, batch over the cache
+  queues/
+    base.py                  the Queue interface + consume/retry/dead-letter
+    memory.py                backend: in-process, for tests
+    files.py                 backend: a directory, for containers on a volume
+    messages.py              ParseRequest and IndexRequest
+  workers/
+    enqueue.py               the producer, and the whole-cache coordinator jobs
+    parse_worker.py          step 1, one document per message
+    index_worker.py          step 2, one document per message
   pipeline.py                ingest / reextract / rechunk, for in-process use
 sql/schema.sql               applied by the db container on first start
-tests/test_wiring.py         both steps end to end, no torch, no database
+tests/test_wiring.py         both steps and both workers, no torch, no database
+tests/test_queues.py         the queue contract, run against every backend
 ```
 
-Each entrypoint file does nothing but call `main()` in its step module, so the
-container invocation and the importable function never drift apart.
+Each entrypoint file does nothing but call `main()` in its step or worker
+module, so the container invocation and the importable function never drift
+apart.
+
+`rag_embeddings/__init__.py` resolves its exports lazily. Importing
+`rag_embeddings.queues` is all a producer needs to put a filename on a queue,
+and eager exports would have made it pay for docling and torch on the way in —
+on the smallest and most-replicated container in the fan-out.
 
 ---
 
@@ -78,6 +102,7 @@ Arguments after the service name go to the step:
 docker compose run --rm parse /data/inbox --pattern '*.pdf' --force
 docker compose run --rm index --tables-only 9f2a...c1
 docker compose run --rm index --stale
+docker compose run --rm index --max-tokens 1024
 ```
 
 Without compose:
@@ -142,6 +167,12 @@ Every knob is a CLI flag with an environment-variable default, resolved once in
 | `RAG_EMBED_PROFILE` | `--profile` | `bge-m3` |
 | `RAG_EMBED_MAX_TOKENS` | `--max-tokens` | from the profile |
 | `RAG_EMBED_HEADROOM` | `--headroom` | `128` |
+| `RAG_QUEUE_URL` | `--queue-url` | `file://./queue` |
+| `RAG_PARSE_QUEUE` | `--parse-queue` | `to-parse` |
+| `RAG_INDEX_QUEUE` | `--index-queue` | `to-index` |
+
+The last three are read only by the workers and the producer; the two batch
+steps ignore them.
 
 Everything model-related still lives in one frozen dataclass. The tokenizer, the
 chunker, and the embedder are all derived from it, so a mismatch between chunk
@@ -206,6 +237,7 @@ That is what ends up in `documents.uri`, while Docling opens the local file.
 python step2_index.py                    # everything in the cache
 python step2_index.py 9f2a...c1 4b81...0e
 python step2_index.py --skip-existing    # only what isn't in the database yet
+python step2_index.py --max-tokens 1024  # smaller chunks than the profile ships
 ```
 
 Loads each cached parse, runs both branches, and writes them in one transaction
@@ -229,6 +261,291 @@ python step2_index.py --stale --chunks-only --profile bge-m3 --max-tokens 2048
 
 `--stale` compares each chunk's stored `chunk_config` against the active profile
 version, so it catches model swaps and token-limit changes alike.
+
+### Chunk size without changing models
+
+`--max-tokens` overrides the named profile's sizing in place, so it needs no
+`--profile` alongside it:
+
+```bash
+docker compose run --rm index --max-tokens 1024
+python step2_index.py --max-tokens 1024
+```
+
+BGE-M3 accepts 8192 tokens, which is a ceiling rather than a recommendation —
+one embedding has to represent everything inside it, and a chunk that spans four
+topics retrieves worse than four chunks that each span one. 1024 (minus the
+default 128 of headroom, so 896 for the splitter) is the usual starting point
+when hits come back topically right but too coarse to quote from.
+
+The model is unchanged, so the vectors stay comparable in dimension — but not in
+content, because the text that produced them is different. That makes it a
+reprocessing trigger, not a query-time knob: it belongs in the `--chunks-only`
+row of the table above, and every document indexed at the old size is now stale.
+`profile.version` embeds the number (`BAAI/bge-m3@1024-128`), so `--stale` sees
+the change on its own:
+
+```bash
+docker compose run --rm index --stale --chunks-only --max-tokens 1024
+```
+
+Set it once and leave it. Half a corpus at 8192 and half at 1024 ranks
+incoherently — long chunks accumulate loosely-related text that matches many
+queries weakly, and they compete against short chunks that match one query
+strongly. `RAG_EMBED_MAX_TOKENS` in the environment is the way to keep it
+consistent across both hosts and invocations.
+
+---
+
+## Running it in parallel
+
+The batch steps walk a directory. The workers are handed one document at a time
+and have no idea how many exist, which is the only difference and the whole
+reason a pool of them can run at once without agreeing on anything.
+
+```mermaid
+flowchart LR
+    producer["<b>enqueue files</b><br><i>S3 event, cron, shell loop</i>"] --> q1[["to-parse"]]
+
+    subgraph pool1 ["parse pool ×N — CPU only, no DB, no model"]
+        direction TB
+        pw1["parse worker"]
+        pw2["parse worker"]
+    end
+
+    subgraph pool2 ["index pool ×M — model resident, holds a connection"]
+        direction TB
+        iw1["index worker"]
+        iw2["index worker"]
+    end
+
+    q1 --> pool1
+    pool1 --> q2[["to-index"]]
+    q2 --> pool2
+    pool2 --> db[(postgres)]
+
+    pool1 -. "write {sha}.json" .-> store[("shared parse cache<br><i>volume today, S3 later</i>")]
+    store -. "load {sha}.json" .-> pool2
+```
+
+`N ≫ M`. Parse workers are CPU and nothing else, so they scale with the
+backlog; index workers each hold an embedding model and a database connection,
+so there are fewer of them and `to-index` is where the difference in throughput
+is allowed to pile up. That backlog is the design, not a problem to fix.
+
+```bash
+docker compose up -d db
+docker compose run --rm enqueue files /data/inbox     # one message per document
+docker compose up --scale parse-worker=4 parse-worker index-worker
+```
+
+The producer also re-enqueues work that is already parsed — both are whole-cache
+or whole-table scans, which is exactly why they belong to a coordinator and not
+to thirty replicas:
+
+```bash
+docker compose run --rm enqueue cached                # re-index everything cached
+docker compose run --rm enqueue stale                 # rechunk after a profile change
+```
+
+Workers exit when their queue has been quiet for `--idle-timeout` seconds, which
+is what makes `compose up` terminate. Omit it and they run forever, which is
+what a Deployment wants.
+
+### The two seams
+
+Nothing above them names a backend, so moving to a cluster is configuration:
+
+| Seam | Today | In a cluster |
+|---|---|---|
+| `RAG_QUEUE_URL` | `file:///queue` — a directory on a shared volume | `sqs://`, `amqp://`, Redis |
+| `RAG_CACHE_DIR` | a bind mount | `s3://bucket/prefix` |
+
+A new queue backend is a `Queue` subclass implementing six transport methods
+and one branch in `open_queue()`. Everything above transport — the receive
+loop, acking, returning failures, counting attempts, dead-lettering — is
+written once in `queues/base.py` and inherited. That is deliberate: swapping
+SQS in should not be an opportunity to get the retry semantics subtly
+different, and `tests/test_queues.py` runs the same contract against every
+backend so a new one either passes or is not done.
+
+A new blob backend is a `BlobStore` with five primitives and two context
+managers. The interface yields *paths* rather than bytes because Docling's
+`save_as_json` / `load_from_json` want a real file; locally that path is the
+cache file itself and nothing is copied, while a remote backend stages a temp
+file and transfers around the yield.
+
+### Why workers and not a container per document
+
+`Embedder.__init__` loads a multi-gigabyte model. Amortised over a pod's
+lifetime that is a startup cost; paid per document it *is* the pipeline. So the
+model and the connection are built before the loop and the loop holds nothing —
+`tests/test_wiring.py` asserts the model is loaded once per worker rather than
+once per message, because that is the property the whole design rests on and it
+would regress silently.
+
+The same argument does not apply to step 1, whose models are much smaller. A
+Job per document is defensible there, and is a reasonable escape hatch for
+outliers: one 900-page scan that needs 16 GB should not size every parse pod.
+
+### Delivery guarantees
+
+At-least-once, never exactly-once, and the pipeline was already built for it:
+work is keyed on the content hash, `documents` is upserted on `sha256`, and both
+branches are delete-then-insert scoped to one `document_id`. A redelivered
+document converges on the rows it already had.
+
+Two workers handed the *same* document are correct but wasteful — the upsert
+takes a row lock, so the second waits out the first and then redoes the work.
+Fine for occasional redelivery; worth fixing in the producer if it is routine.
+
+A worker killed mid-document leaves its claim behind, and the next `receive` on
+any worker reclaims claims older than `--visibility-timeout` and puts them
+back. A document that reliably kills the parser is a poison message: after
+`--max-attempts` deliveries it goes to the queue's `dead/` slot and the worker
+carries on with the backlog rather than dying with it.
+
+### What to watch when this moves to k8s or ECS
+
+- **Scale on queue depth**, which is what `Queue.depth()` is for — a KEDA
+  `ScaledObject` per queue, or SQS backlog-per-task on ECS. Scale the two pools
+  separately or the expensive one dictates the cheap one.
+- **Pin the thread count.** torch takes every core it can see. Eight parse pods
+  on a sixteen-core node without `OMP_NUM_THREADS` set to each pod's CPU limit
+  is eight-way oversubscription, and throughput lands *below* serial. Compose
+  sets it; a manifest must too.
+- **Do not let a cold pod download 2.6 GB** of weights — it defeats the
+  autoscaling it is supposed to serve. Build with `PREFETCH_MODELS=1`. That in
+  turn weakens the one-image argument: with weights baked, the parse image does
+  not need BGE-M3 and the index image does not need the layout models, though it
+  still needs the docling library for the chunker.
+- **Bound the index pool by Postgres, not by CPU.** Every replica holds a
+  connection, and the HNSW index on `chunks.embedding` is a shared write
+  structure that stops rewarding parallelism well before the connection limit
+  does. Put a pooler in front, and for a large backfill drop the index, load,
+  and rebuild.
+- **`FileQueue` is the development backend.** It scans `ready/` on every
+  receive, so a very deep queue gets slow, and its claim is atomic only where
+  `rename` is — fine on a local volume or EBS, not on NFS with the wrong mount
+  options.
+
+---
+
+## Checking that the embeddings landed
+
+Step 2 succeeding is not the same as retrieval working. The failures worth
+catching here are quiet ones: rows written with a null vector, every vector
+identical, or a query embedded through a different profile than the passages
+were. Each has its own query, cheapest first.
+
+```bash
+docker compose exec db psql -U postgres -d docs
+```
+
+**Did anything write.**
+
+```sql
+select d.id, d.uri, d.status,
+       count(c.id)                              as chunks,
+       count(c.embedding)                       as embedded,
+       count(*) filter (where c.embedding is null) as missing
+from documents d
+left join chunks c on c.document_id = d.id
+group by d.id order by d.id;
+```
+
+`chunks = 0` across the board means step 2 never ran, or ran `--tables-only`.
+`missing > 0` is worse: the chunk branch wrote rows but the model produced no
+vector for them, so those chunks are unreachable by search while looking present
+in every count you take.
+
+**Are the vectors real.**
+
+```sql
+select embed_model,
+       chunk_config,
+       count(*),
+       min(sqrt(-(embedding <#> embedding)))::numeric(6,4) as min_norm,
+       max(sqrt(-(embedding <#> embedding)))::numeric(6,4) as max_norm,
+       count(distinct embedding::text)                     as distinct_vecs
+from chunks
+group by embed_model, chunk_config;
+```
+
+`<#>` is negative inner product, so `sqrt(-(v <#> v))` is the L2 norm. That
+detour exists because `l2_norm()` is ambiguous against pgvector's `halfvec` and
+`sparsevec` overloads on pg17 — it fails with `function l2_norm(vector) is not
+unique`, and an explicit cast does not rescue it.
+
+Norms should be 1.0000 on every row — `encode_passages` normalizes, so anything
+else means the vector arrived from some path other than that one. `distinct_vecs`
+close to `count` is the check that matters: collapse to a handful means the model
+returned the same vector for every input, which is what empty or whitespace chunk
+text produces. More than one `chunk_config` group is a half-reprocessed corpus,
+the incoherent state the previous section warns about.
+
+**Does similarity behave.** This proves retrieval end to end without loading the
+model, by using a stored chunk as its own query:
+
+```sql
+with probe as (select id, embedding from chunks order by id limit 1)
+select c.id, c.ord,
+       (c.embedding <=> p.embedding)::numeric(8,5) as dist,
+       left(c.text, 80)                            as snippet
+from chunks c, probe p
+order by c.embedding <=> p.embedding
+limit 10;
+```
+
+Row one must be the probe itself at distance ~0; that is the assertion. After it,
+distances should rise smoothly over text that is plausibly related. Everything at
+~0, or everything bunched at ~1, means degenerate vectors regardless of what the
+norm check said.
+
+**Is the index live.**
+
+```sql
+explain analyze
+select id from chunks
+order by embedding <=> (select embedding from chunks limit 1)
+limit 10;
+```
+
+Look for `Index Scan using chunks_embedding_idx`. A `Seq Scan` on a few thousand
+rows is the planner being correct — brute force really is faster there — but on a
+full corpus it means the HNSW index isn't being used and every search is scanning
+the table.
+
+**Overflow, after any `--max-tokens` change.**
+
+```sql
+select document_id, ord, token_count from chunks
+where token_count > 8192;                -- or the limit you indexed at
+```
+
+**The one that needs the model.** Everything above passes even when the query
+side and the passage side disagree about the profile, because nothing above
+embeds a query. A mismatch there — wrong model, missing E5 prefix — does not
+raise; it just ranks badly:
+
+```python
+from rag_embeddings import Embedder, Settings, connect
+
+s = Settings.from_env()
+emb, conn = Embedder(s.profile), connect(s.dsn)
+
+qvec = emb.encode_query("what were the Q3 logistics costs?")
+for row in conn.execute(
+    "select ord, page, left(text, 100) from chunks "
+    "order by embedding <=> %s::vector limit 5",
+    (qvec,),
+).fetchall():
+    print(row)
+```
+
+Run it with a question you already know the answer to. It is the only check that
+covers the query path, and a plausible-looking ranking of the wrong passages is
+exactly what a profile mismatch looks like.
 
 ---
 
@@ -361,12 +678,27 @@ comment on `dependencies` in `pyproject.toml`.
 
 ```bash
 python tests/test_wiring.py
+python tests/test_queues.py
 ```
 
-Stubs Docling, sentence-transformers and psycopg, then runs step 1 into a temp
-cache and step 2 out of it, asserting the manifest round-trip, the statement
-order inside the transaction, and that `--tables-only` never loads a model. No
-torch, no database, under a second.
+`test_wiring.py` stubs Docling, sentence-transformers and psycopg, then runs
+step 1 into a temp cache and step 2 out of it, asserting the manifest
+round-trip, the statement order inside the transaction, and that
+`--tables-only` never loads a model. It then runs the same work over a queue:
+producer, two parse workers sharing one queue, one index worker — asserting
+that no document is lost or handled twice, that the manifest arrives on the
+message rather than being read off disk, that a missing parse is dead-lettered
+instead of retried forever while the document behind it still gets written, and
+that the model is loaded once per worker rather than once per message.
+
+`test_queues.py` runs one set of assertions against every backend, because that
+is the claim the abstraction makes. It covers FIFO order, claim exclusivity,
+nack redelivery, attempt counting, visibility-timeout recovery from a worker
+that died holding a claim, and dead-lettering — including six threads consuming
+one queue with no coordination, which is the property the whole fan-out rests
+on.
+
+No torch, no database, no broker. Both run in about a second.
 
 ---
 

@@ -1,6 +1,7 @@
 .git
 .gitignore
 cache/
+queue/
 inbox/
 models/
 *.md

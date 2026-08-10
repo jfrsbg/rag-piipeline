@@ -1,12 +1,26 @@
-# The two steps are `run` services, not `up` services: they are batch jobs that
-# exit, and running them separately is the whole point of the split.
+# Two ways to run the same pipeline.
+#
+# Batch — the steps run to completion over a directory. Simplest thing that
+# works, and still the right thing for a laptop or a backfill:
 #
 #   docker compose up -d db
 #   docker compose run --rm parse /data/inbox
 #   docker compose run --rm index
 #
-# Anything after the service name is appended to the step's own arguments, so
-# `docker compose run --rm index --tables-only <sha>` works as written.
+# Queued — a producer publishes one message per document and pools of workers
+# consume them, which is the shape that survives being moved to k8s or ECS:
+#
+#   docker compose up -d db
+#   docker compose run --rm enqueue files /data/inbox
+#   docker compose up parse-worker index-worker
+#
+# The workers exit when their queue is quiet (RAG_IDLE_TIMEOUT), so `up`
+# terminates instead of hanging. Drop the flag for the long-lived behaviour a
+# Deployment wants. `--scale parse-worker=4` is the fan-out: nothing
+# coordinates them, the rename in the queue directory does.
+#
+# Anything after the service name is appended to that command's own arguments,
+# so `docker compose run --rm index --tables-only <sha>` works as written.
 
 x-app: &app
   build:
@@ -16,10 +30,18 @@ x-app: &app
     RAG_PARSER_VERSION: ${RAG_PARSER_VERSION:-docling-2.118}
     RAG_EMBED_PROFILE: ${RAG_EMBED_PROFILE:-bge-m3}
     RAG_DSN: postgresql://postgres:postgres@db:5432/docs
+    # The queue is a directory on a shared volume. Swapping the backend is this
+    # one variable — see rag_embeddings/queues/__init__.py.
+    RAG_QUEUE_URL: ${RAG_QUEUE_URL:-file:///queue}
     HF_HOME: /models
+    # torch takes every core it can see. Packing several workers onto one host
+    # without this gives you N processes fighting over the same cores and less
+    # throughput than running one. Set it to each container's CPU allocation.
+    OMP_NUM_THREADS: ${OMP_NUM_THREADS:-2}
   volumes:
     - ./cache:/cache
     - ./inbox:/data/inbox:ro
+    - queue:/queue
     - hf-models:/models
 
 services:
@@ -40,6 +62,8 @@ services:
       timeout: 3s
       retries: 10
 
+  # ---------------------------------------------------------------- batch
+
   # Step 1 — parse and cache. No database dependency by design.
   parse:
     <<: *app
@@ -55,6 +79,41 @@ services:
       db:
         condition: service_healthy
 
+  # --------------------------------------------------------------- queued
+
+  # The producer. Also `enqueue cached` to re-index what is already parsed and
+  # `enqueue stale` to rechunk after a profile change — both whole-cache scans,
+  # which is why they live here and not in a worker.
+  enqueue:
+    <<: *app
+    entrypoint: ["python", "enqueue.py"]
+    command: ["files", "/data/inbox"]
+
+  # Step 1's pool. CPU-bound, no database, no model — scale this one freely.
+  #   docker compose up --scale parse-worker=4 parse-worker
+  parse-worker:
+    <<: *app
+    entrypoint: ["python", "worker_parse.py"]
+    command: ["--idle-timeout", "${RAG_IDLE_TIMEOUT:-5}"]
+    deploy:
+      replicas: ${PARSE_WORKERS:-2}
+
+  # Step 2's pool. Holds a resident embedding model and a database connection,
+  # so it is deliberately smaller than the parse pool: past a handful of
+  # replicas the HNSW index on chunks.embedding, not the CPU, is the limit.
+  index-worker:
+    <<: *app
+    entrypoint: ["python", "worker_index.py"]
+    command: ["--idle-timeout", "${RAG_IDLE_TIMEOUT:-5}"]
+    deploy:
+      replicas: ${INDEX_WORKERS:-1}
+    depends_on:
+      db:
+        condition: service_healthy
+
 volumes:
   pgdata:
   hf-models:
+  # Shared by every worker. On a cluster this is the broker, and the cache
+  # volume beside it is object storage.
+  queue:

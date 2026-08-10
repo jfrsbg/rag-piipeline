@@ -85,6 +85,8 @@ RUN if [ "$PREFETCH_MODELS" = "1" ]; then \
 
 COPY rag_embeddings ./rag_embeddings
 COPY step1_parse.py step2_index.py ./
+# The same two steps as queue consumers, plus the producer that feeds them.
+COPY worker_parse.py worker_index.py enqueue.py ./
 
 # Installs the project itself against the deps already present above. Also puts
 # the `rag-parse` / `rag-index` console scripts on PATH, which the step files
@@ -92,7 +94,7 @@ COPY step1_parse.py step2_index.py ./
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv sync --locked --extra ${TORCH_EXTRA}
 
-RUN mkdir -p /cache/parsed /models
+RUN mkdir -p /cache/parsed /models /queue
 
 # The step file is the argument, so neither step is the image's "default" one.
 ENTRYPOINT ["python"]
