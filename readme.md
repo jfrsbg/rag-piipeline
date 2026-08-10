@@ -38,6 +38,7 @@ above describes. See [Running it in parallel](#running-it-in-parallel).
 ```
 step1_parse.py               entrypoint: parse and cache
 step2_index.py               entrypoint: extract and store
+search.py                    entrypoint: query the indexed chunks
 enqueue.py                   entrypoint: publish work onto a queue
 worker_parse.py              entrypoint: step 1 as a queue consumer
 worker_index.py              entrypoint: step 2 as a queue consumer
@@ -58,6 +59,7 @@ rag_embeddings/
   steps/
     parse.py                 step 1, batch over a directory
     index.py                 step 2, batch over the cache
+    search.py                the read side: embed a query, rank chunks
   queues/
     base.py                  the Queue interface + consume/retry/dead-letter
     memory.py                backend: in-process, for tests
@@ -167,12 +169,21 @@ Every knob is a CLI flag with an environment-variable default, resolved once in
 | `RAG_EMBED_PROFILE` | `--profile` | `bge-m3` |
 | `RAG_EMBED_MAX_TOKENS` | `--max-tokens` | from the profile |
 | `RAG_EMBED_HEADROOM` | `--headroom` | `128` |
+| `RAG_EMBED_TOKEN_BUDGET` | `--embed-token-budget` | `16384` |
 | `RAG_QUEUE_URL` | `--queue-url` | `file://./queue` |
 | `RAG_PARSE_QUEUE` | `--parse-queue` | `to-parse` |
 | `RAG_INDEX_QUEUE` | `--index-queue` | `to-index` |
 
 The last three are read only by the workers and the producer; the two batch
 steps ignore them.
+
+`RAG_EMBED_TOKEN_BUDGET` is the odd one out: it is hardware sizing, not model
+semantics. It caps tokens per forward pass — sequences times padded length —
+rather than sequences per batch, because that product is what a transformer's
+peak allocation actually follows. It changes throughput and memory only; the
+vectors and `profile.version` are identical either way, so it never makes a row
+stale. Lower it if `index-worker` is OOM-killed (exit 137); see
+[Things that will bite you](#things-that-will-bite-you).
 
 Everything model-related still lives in one frozen dataclass. The tokenizer, the
 chunker, and the embedder are all derived from it, so a mismatch between chunk
@@ -348,9 +359,21 @@ docker compose run --rm enqueue cached                # re-index everything cach
 docker compose run --rm enqueue stale                 # rechunk after a profile change
 ```
 
-Workers exit when their queue has been quiet for `--idle-timeout` seconds, which
-is what makes `compose up` terminate. Omit it and they run forever, which is
-what a Deployment wants.
+Workers block on an empty queue and run until they are stopped, which is what a
+Deployment wants: `to-index` sitting empty for an hour is a drained backlog, not
+a reason to exit. `--idle-timeout` (or `RAG_IDLE_TIMEOUT`) is the batch shape —
+a worker exits once its queue has been quiet that many seconds, which is what
+makes `compose up` terminate on a laptop:
+
+```bash
+RAG_IDLE_TIMEOUT=5 docker compose up parse-worker index-worker
+```
+
+Note that an idle timeout interacts with `--visibility-timeout` (default 300s):
+a worker that exits while a message is still in flight leaves it in `inflight`,
+and the next worker to start reclaims it with an attempt already spent. Short
+idle timeouts and long visibility timeouts can therefore burn a message's
+`--max-attempts` across restarts without it ever being tried properly.
 
 ### The two seams
 
@@ -547,6 +570,12 @@ Run it with a question you already know the answer to. It is the only check that
 covers the query path, and a plausible-looking ranking of the wrong passages is
 exactly what a profile mismatch looks like.
 
+That snippet is `search.py`, with the profile check and the formatting added:
+
+```bash
+docker compose run --rm search "what were the Q3 logistics costs?"
+```
+
 ---
 
 ## Using it as a library
@@ -590,7 +619,36 @@ Before building the HNSW index on a large table, raise `maintenance_work_mem`
 
 ## Querying
 
-**Semantic search.** Embed the query through the same profile — same model, same
+`search.py` is the read side as a script — one query in, ranked chunks out:
+
+```bash
+docker compose run --rm search "what were the Q3 logistics costs?"
+docker compose run --rm search "patrimônio líquido em junho" -k 10
+docker compose run --rm search "logistics costs" --window 1     # neighbours too
+docker compose run --rm search "logistics costs" --json         # for a pipe
+
+python search.py "what were the Q3 logistics costs?"            # or locally
+```
+
+It takes the same `--profile` / `--max-tokens` / `--dsn` flags as step 2,
+defaulting from the same environment, which is the point: the query has to be
+embedded by the model that embedded the passages. It cannot enforce that, so it
+checks — a corpus indexed under a `chunk_config` the active profile doesn't
+match logs a warning before the results, and any hit that disagrees is printed
+with `STALE`. Nothing raises, because a profile mismatch never raises; it just
+ranks the wrong passages convincingly.
+
+Output is one line per hit — cosine distance, uri, page, `ord` — followed by
+the chunk text. Read the distances rather than the top hit alone: they should
+rise smoothly, and everything bunched at ~0 or ~1 means degenerate vectors,
+which is the [previous section's](#checking-that-the-embeddings-landed) check.
+
+`-k` is how many chunks come back, not how many documents; a long report can
+own every row. `--window N` prints N chunks either side of each hit, which is
+the widening query below done for you — worth it whenever a hit reads as though
+it starts mid-sentence, because it does.
+
+Under the hood, embed the query through the same profile — same model, same
 normalization, same prefix:
 
 ```python
@@ -648,6 +706,18 @@ select document_id, ord, token_count from chunks where token_count > 8192;
 
 If that returns rows, either raise `headroom` or add a hard splitter for those
 cases. Wide tables and deep heading paths are the usual causes.
+
+**One long chunk decides the whole batch's memory.** `index-worker` dying with
+exit 137 and no traceback is the OOM killer, not a bug in your document — look
+for `OOMKilled: true` in `docker inspect`. A batch is padded to its longest
+member, so a single 5 000-token chunk among 500-token ones makes every sequence
+in the pass 5 000 tokens wide; peak allocation follows sequences × padded
+length × the model's 4096-wide feed-forward layer, which is why a fixed batch
+size bounds nothing. `encode_passages` therefore batches to
+`RAG_EMBED_TOKEN_BUDGET` tokens rather than to a count of sequences. Lower the
+budget before raising `mem_limit` — the compose file caps `index-worker` at 4 GB
+so a bad batch fails as one container instead of taking the database down with
+it.
 
 **`ord` must stay dense.** It's assigned by `enumerate` over the chunker's
 output, and the emission order *is* reading order. If you add filtering (dropping

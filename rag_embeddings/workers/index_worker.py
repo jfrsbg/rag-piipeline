@@ -123,7 +123,7 @@ def run(
     # Both before the loop. This is the entire point of the worker.
     if emb is None and with_chunks:
         log.info("loading %s", settings.profile.model_id)
-        emb = Embedder(settings.profile)
+        emb = Embedder(settings.profile, token_budget=settings.embed_token_budget)
     conn = conn or connect(settings.dsn)
 
     log.info("index worker up: %r, %d waiting", index_queue, index_queue.depth())

@@ -10,7 +10,7 @@ from __future__ import annotations
 import argparse
 import logging
 
-from .config import Settings
+from .config import Settings, idle_timeout_from_env
 # From `base` rather than the package, so importing the argument plumbing does
 # not drag in a backend — or, through the message types, docling.
 from .queues.base import DEFAULT_MAX_ATTEMPTS, DEFAULT_VISIBILITY_TIMEOUT
@@ -34,6 +34,12 @@ def add_profile_args(parser: argparse.ArgumentParser) -> None:
     group.add_argument("--profile", help="named profile or HF model id [RAG_EMBED_PROFILE]")
     group.add_argument("--max-tokens", type=int, help="from the model card [RAG_EMBED_MAX_TOKENS]")
     group.add_argument("--headroom", type=int, help="[RAG_EMBED_HEADROOM]")
+    group.add_argument(
+        "--embed-token-budget",
+        type=int,
+        help="tokens per forward pass, padding included; lower this if the "
+             "worker is OOM-killed [RAG_EMBED_TOKEN_BUDGET]",
+    )
 
 
 def add_db_args(parser: argparse.ArgumentParser) -> None:
@@ -58,9 +64,10 @@ def add_worker_args(parser: argparse.ArgumentParser) -> None:
     group.add_argument(
         "--idle-timeout",
         type=float,
-        default=None,
-        help="seconds to wait on an empty queue before exiting; omit to run "
-             "forever, which is what a Deployment wants",
+        default=idle_timeout_from_env(),
+        help="seconds to wait on an empty queue before exiting; unset means "
+             "run forever, which is what a Deployment wants "
+             "[RAG_IDLE_TIMEOUT]",
     )
     group.add_argument(
         "--max-messages",
@@ -91,6 +98,7 @@ def settings_from(args: argparse.Namespace) -> Settings:
         profile=getattr(args, "profile", None),
         max_tokens=getattr(args, "max_tokens", None),
         headroom=getattr(args, "headroom", None),
+        embed_token_budget=getattr(args, "embed_token_budget", None),
         queue_url=getattr(args, "queue_url", None),
         parse_queue=getattr(args, "parse_queue", None),
         index_queue=getattr(args, "index_queue", None),

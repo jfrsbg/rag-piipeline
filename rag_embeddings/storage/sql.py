@@ -35,3 +35,30 @@ select distinct d.sha256 from documents d
 join chunks c on c.document_id = d.id
 where c.chunk_config <> %s
 """
+
+# --------------------------------------------------------------- read side
+
+# Cosine distance, which is what chunks_embedding_idx is built for: any other
+# operator here silently drops to a sequential scan. `chunk_config` comes back
+# on every row because a hit embedded through a different profile than the
+# query ranks badly rather than failing, and that is the only place it shows.
+CHUNK_SEARCH = """
+select c.id, c.document_id, c.ord, c.page, c.text, c.heading_path,
+       c.chunk_config, d.uri,
+       c.embedding <=> %(qvec)s::vector as dist
+from chunks c
+join documents d on d.id = c.document_id
+order by c.embedding <=> %(qvec)s::vector
+limit %(limit)s
+"""
+
+# Chunks are stored without overlap, so the neighbours are a separate lookup —
+# that is what `ord` and chunks_document_ord_idx are for.
+CHUNK_WINDOW = """
+select ord, text from chunks
+where document_id = %(document_id)s
+  and ord between %(ord)s - %(window)s and %(ord)s + %(window)s
+order by ord
+"""
+
+CHUNK_CONFIGS = "select distinct chunk_config from chunks"

@@ -14,10 +14,11 @@
 #   docker compose run --rm enqueue files /data/inbox
 #   docker compose up parse-worker index-worker
 #
-# The workers exit when their queue is quiet (RAG_IDLE_TIMEOUT), so `up`
-# terminates instead of hanging. Drop the flag for the long-lived behaviour a
-# Deployment wants. `--scale parse-worker=4` is the fan-out: nothing
-# coordinates them, the rename in the queue directory does.
+# The workers stay up until they are stopped, so that `up` does not end the
+# moment the backlog drains. `RAG_IDLE_TIMEOUT=5` is the batch shape instead:
+# each exits once its queue has been quiet that long. `--scale parse-worker=4`
+# is the fan-out: nothing coordinates them, the rename in the queue directory
+# does.
 #
 # Anything after the service name is appended to that command's own arguments,
 # so `docker compose run --rm index --tables-only <sha>` works as written.
@@ -29,10 +30,18 @@ x-app: &app
     RAG_CACHE_DIR: /cache/parsed
     RAG_PARSER_VERSION: ${RAG_PARSER_VERSION:-docling-2.118}
     RAG_EMBED_PROFILE: ${RAG_EMBED_PROFILE:-bge-m3}
+    # Tokens per forward pass, padding included — the knob that bounds the
+    # embedder's peak memory. Lower it before raising mem_limit below.
+    RAG_EMBED_TOKEN_BUDGET: ${RAG_EMBED_TOKEN_BUDGET:-16384}
     RAG_DSN: postgresql://postgres:postgres@db:5432/docs
     # The queue is a directory on a shared volume. Swapping the backend is this
     # one variable — see rag_embeddings/queues/__init__.py.
     RAG_QUEUE_URL: ${RAG_QUEUE_URL:-file:///queue}
+    # Empty means a worker blocks on an empty queue forever, which is what a
+    # Deployment wants. Set it to a number of seconds for the batch shape:
+    # workers then exit once their queue has been quiet that long, so
+    # `compose up` terminates. Ignored by everything that is not a worker.
+    RAG_IDLE_TIMEOUT: ${RAG_IDLE_TIMEOUT:-}
     HF_HOME: /models
     # torch takes every core it can see. Packing several workers onto one host
     # without this gives you N processes fighting over the same cores and less
@@ -79,6 +88,19 @@ services:
       db:
         condition: service_healthy
 
+  # The read side. Same profile as `index` by construction — both take it from
+  # RAG_EMBED_PROFILE above, which is the mismatch this service exists to
+  # avoid: a query embedded through a different model ranks badly, silently.
+  #
+  #   docker compose run --rm search "what were the Q3 logistics costs?"
+  search:
+    <<: *app
+    entrypoint: ["python", "search.py"]
+    command: []
+    depends_on:
+      db:
+        condition: service_healthy
+
   # --------------------------------------------------------------- queued
 
   # The producer. Also `enqueue cached` to re-index what is already parsed and
@@ -94,7 +116,12 @@ services:
   parse-worker:
     <<: *app
     entrypoint: ["python", "worker_parse.py"]
-    command: ["--idle-timeout", "${RAG_IDLE_TIMEOUT:-5}"]
+    command: []
+    # A worker meant to outlive its backlog has to outlive a crash too. Only on
+    # failure, and bounded: a clean exit is the idle timeout doing its job and
+    # must not be undone, and a worker that dies three times on startup is a bad
+    # mount, which a restart loop would hide rather than fix.
+    restart: on-failure:3
     deploy:
       replicas: ${PARSE_WORKERS:-2}
 
@@ -104,7 +131,17 @@ services:
   index-worker:
     <<: *app
     entrypoint: ["python", "worker_index.py"]
-    command: ["--idle-timeout", "${RAG_IDLE_TIMEOUT:-5}"]
+    command: []
+    # As above. The failure this mostly catches is the OOM kill that mem_limit
+    # below turns into one dead container, and restarting is only affordable
+    # because the model is already on the hf-models volume.
+    restart: on-failure:3
+    # ~2.3 GB of that is the resident fp32 model; the rest is one forward pass,
+    # which RAG_EMBED_TOKEN_BUDGET bounds. Unlimited is the wrong default here:
+    # an oversized batch then takes the whole Docker VM, and the database with
+    # it, instead of failing as one container. This is the cgroup equivalent of
+    # the k8s memory limit these workers would carry in a cluster.
+    mem_limit: ${INDEX_WORKER_MEM:-4g}
     deploy:
       replicas: ${INDEX_WORKERS:-1}
     depends_on:

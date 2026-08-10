@@ -23,11 +23,30 @@ DEFAULT_DSN = "postgresql://localhost/docs"
 DEFAULT_QUEUE_URL = "file://./queue"
 DEFAULT_PARSE_QUEUE = "to-parse"
 DEFAULT_INDEX_QUEUE = "to-index"
+# Tokens per forward pass, padding included — see rag_embeddings/embedder.py
+# for what the number buys. It is hardware sizing, not model semantics, which
+# is why it lives here and not on the profile: changing it must not change the
+# vectors, and must not change `profile.version` stamped on the rows.
+DEFAULT_EMBED_TOKEN_BUDGET = 16384
 
 
 def _int_env(name: str) -> int | None:
     raw = os.environ.get(name)
     return int(raw) if raw not in (None, "") else None
+
+
+def idle_timeout_from_env() -> float | None:
+    """Seconds a worker waits on an empty queue before exiting; None is forever.
+
+    Not on `Settings`: the batch steps have no loop to bound, and a worker's
+    exit condition is per-container rather than per-deployment. It is read here
+    anyway so that the rule about os.environ living in one module holds.
+
+    Unset and empty both mean forever, because that is what a Deployment wants
+    and because `${RAG_IDLE_TIMEOUT:-}` in compose expands to empty.
+    """
+    raw = os.environ.get("RAG_IDLE_TIMEOUT")
+    return float(raw) if raw not in (None, "") else None
 
 
 @dataclass(frozen=True)
@@ -36,6 +55,7 @@ class Settings:
     parser_version: str
     dsn: str
     profile: EmbedProfile
+    embed_token_budget: int = DEFAULT_EMBED_TOKEN_BUDGET
     # Only the workers read these; the two batch steps ignore them entirely.
     queue_url: str = DEFAULT_QUEUE_URL
     parse_queue: str = DEFAULT_PARSE_QUEUE
@@ -51,6 +71,7 @@ class Settings:
         profile: str | None = None,
         max_tokens: int | None = None,
         headroom: int | None = None,
+        embed_token_budget: int | None = None,
         queue_url: str | None = None,
         parse_queue: str | None = None,
         index_queue: str | None = None,
@@ -88,6 +109,11 @@ class Settings:
                     if headroom is not None
                     else _int_env("RAG_EMBED_HEADROOM")
                 ),
+            ),
+            embed_token_budget=(
+                embed_token_budget
+                if embed_token_budget is not None
+                else _int_env("RAG_EMBED_TOKEN_BUDGET") or DEFAULT_EMBED_TOKEN_BUDGET
             ),
             queue_url=(
                 queue_url or os.environ.get("RAG_QUEUE_URL") or DEFAULT_QUEUE_URL

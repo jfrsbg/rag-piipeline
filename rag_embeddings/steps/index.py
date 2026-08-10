@@ -116,7 +116,11 @@ def index_documents(
             log.info("step 2: nothing to index")
             return []
 
-        emb = Embedder(settings.profile) if with_chunks else None
+        emb = (
+            Embedder(settings.profile, token_budget=settings.embed_token_budget)
+            if with_chunks
+            else None
+        )
         log.info(
             "step 2: %d document(s), branches=%s%s",
             len(selected),

@@ -84,7 +84,7 @@ RUN if [ "$PREFETCH_MODELS" = "1" ]; then \
     fi
 
 COPY rag_embeddings ./rag_embeddings
-COPY step1_parse.py step2_index.py ./
+COPY step1_parse.py step2_index.py search.py ./
 # The same two steps as queue consumers, plus the producer that feeds them.
 COPY worker_parse.py worker_index.py enqueue.py ./
 
