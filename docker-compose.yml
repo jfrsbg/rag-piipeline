@@ -22,11 +22,20 @@
 #
 # Anything after the service name is appended to that command's own arguments,
 # so `docker compose run --rm index --tables-only <sha>` works as written.
+#
+# Either way, the read side is a service rather than a step — it stays up,
+# holds the model resident and answers HTTP:
+#
+#   docker compose up -d api
+#   curl -s localhost:8000/search -H 'content-type: application/json' \
+#        -d '{"query": "what were the Q3 logistics costs?"}'
 
 x-app: &app
   build:
     context: .
-  environment:
+  # Anchored separately so a service can add one variable to this set instead
+  # of restating it — merging into a mapping replaces the whole key.
+  environment: &app-env
     RAG_CACHE_DIR: /cache/parsed
     RAG_PARSER_VERSION: ${RAG_PARSER_VERSION:-docling-2.118}
     RAG_EMBED_PROFILE: ${RAG_EMBED_PROFILE:-bge-m3}
@@ -88,15 +97,47 @@ services:
       db:
         condition: service_healthy
 
-  # The read side. Same profile as `index` by construction — both take it from
-  # RAG_EMBED_PROFILE above, which is the mismatch this service exists to
-  # avoid: a query embedded through a different model ranks badly, silently.
+  # ------------------------------------------------------------------ read
+
+  # The read side, served rather than run. Same profile as `index` by
+  # construction — both take it from RAG_EMBED_PROFILE above, which is the
+  # mismatch this service exists to avoid: a query embedded through a different
+  # model ranks badly, silently.
   #
-  #   docker compose run --rm search "what were the Q3 logistics costs?"
-  search:
+  #   docker compose up -d api
+  #   curl -s localhost:8000/search -H 'content-type: application/json' \
+  #        -d '{"query": "what were the Q3 logistics costs?", "limit": 10}'
+  #
+  # Interactive docs at localhost:8000/docs.
+  api:
     <<: *app
-    entrypoint: ["python", "search.py"]
-    command: []
+    # Its own image: the serving stack, without the step scripts. Everything
+    # else — profile, DSN, thread count — still comes from the anchor above,
+    # which is what keeps it indexing-compatible with `index`.
+    build:
+      context: .
+      dockerfile: Dockerfile.api
+    # No inbox, no queue, no parse cache: this container reads the database and
+    # the model volume, and that is the whole of its access.
+    volumes:
+      - hf-models:/models
+    ports:
+      - "${RAG_API_PORT:-8000}:8000"
+    # Concurrent requests borrow from a pool of this size. Raising it past the
+    # cores OMP_NUM_THREADS grants only queues the forward passes differently.
+    environment:
+      <<: *app-env
+      RAG_API_POOL_SIZE: ${RAG_API_POOL_SIZE:-4}
+      # The startup profile check logs at WARNING; DEBUG adds the query path.
+      RAG_LOG_LEVEL: ${RAG_LOG_LEVEL:-INFO}
+    # As with index-worker, and for the same reason: ~2.3 GB of this is the
+    # resident fp32 model, and an unbounded container takes the Docker VM and
+    # the database with it instead of failing alone.
+    mem_limit: ${API_MEM:-4g}
+    # A service is meant to stay up. Bounded, so that three crashes on startup
+    # surface as a stopped container rather than a restart loop hiding a bad
+    # DSN — the pool refuses to open if the database is unreachable.
+    restart: on-failure:3
     depends_on:
       db:
         condition: service_healthy

@@ -28,6 +28,11 @@ DEFAULT_INDEX_QUEUE = "to-index"
 # is why it lives here and not on the profile: changing it must not change the
 # vectors, and must not change `profile.version` stamped on the rows.
 DEFAULT_EMBED_TOKEN_BUDGET = 16384
+# The read side, served rather than run: see rag_embeddings/api. 0.0.0.0
+# because the only caller is outside the container.
+DEFAULT_API_HOST = "0.0.0.0"
+DEFAULT_API_PORT = 8000
+DEFAULT_API_POOL_SIZE = 4
 
 
 def _int_env(name: str) -> int | None:
@@ -47,6 +52,34 @@ def idle_timeout_from_env() -> float | None:
     """
     raw = os.environ.get("RAG_IDLE_TIMEOUT")
     return float(raw) if raw not in (None, "") else None
+
+
+@dataclass(frozen=True)
+class ApiSettings:
+    """How the service is served, as opposed to what it serves.
+
+    Separate from `Settings` because none of it reaches the search path: the
+    same query against the same corpus returns the same hits whatever port
+    answered. It is here rather than in the API package only to keep the rule
+    that os.environ is read in one module.
+    """
+
+    host: str = DEFAULT_API_HOST
+    port: int = DEFAULT_API_PORT
+    log_level: str = "INFO"
+    # Requests are served from a threadpool, so connections must be borrowed
+    # per request rather than shared. Past a handful the embedding forward
+    # pass, not the database, is the limit.
+    pool_size: int = DEFAULT_API_POOL_SIZE
+
+    @classmethod
+    def from_env(cls) -> "ApiSettings":
+        return cls(
+            host=os.environ.get("RAG_API_HOST") or DEFAULT_API_HOST,
+            port=_int_env("RAG_API_PORT") or DEFAULT_API_PORT,
+            log_level=os.environ.get("RAG_LOG_LEVEL") or "INFO",
+            pool_size=_int_env("RAG_API_POOL_SIZE") or DEFAULT_API_POOL_SIZE,
+        )
 
 
 @dataclass(frozen=True)

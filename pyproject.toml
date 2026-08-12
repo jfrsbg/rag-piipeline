@@ -23,7 +23,9 @@ dependencies = [
     "docling>=2.118.1,<3",
     "docling-core[chunking]>=2.91.0,<3",
     "sentence-transformers>=5.7.0,<6",
-    "psycopg[binary]>=3.3.4,<4",
+    # `pool` is what the API borrows connections from; the batch steps and the
+    # workers each hold exactly one and ignore it.
+    "psycopg[binary,pool]>=3.3.4,<4",
     "pgvector>=0.5.0,<1",
 ]
 
@@ -36,11 +38,20 @@ dependencies = [
 cpu = ["torch", "torchvision"]
 cu126 = ["torch", "torchvision"]
 
+# The serving stack, kept out of the base set so the batch and worker images —
+# which have no HTTP surface — do not carry it. Dockerfile.api selects it;
+# Dockerfile does not.
+api = [
+    "fastapi>=0.118,<1",
+    "uvicorn[standard]>=0.38,<1",
+]
+
 [project.scripts]
 rag-parse = "rag_embeddings.steps.parse:main"
 rag-index = "rag_embeddings.steps.index:main"
-# The read side: the query path nothing else exercises.
-rag-search = "rag_embeddings.steps.search:main"
+# The read side: the query path nothing else exercises. A service now, so it
+# takes a port rather than a question — see rag_embeddings/api.
+rag-serve = "rag_embeddings.api.app:main"
 # The same two steps, one document per message. See rag_embeddings/workers.
 rag-enqueue = "rag_embeddings.workers.enqueue:main"
 rag-parse-worker = "rag_embeddings.workers.parse_worker:main"

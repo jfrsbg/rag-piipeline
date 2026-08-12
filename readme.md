@@ -38,7 +38,7 @@ above describes. See [Running it in parallel](#running-it-in-parallel).
 ```
 step1_parse.py               entrypoint: parse and cache
 step2_index.py               entrypoint: extract and store
-search.py                    entrypoint: query the indexed chunks
+serve.py                     entrypoint: the search API (FastAPI)
 enqueue.py                   entrypoint: publish work onto a queue
 worker_parse.py              entrypoint: step 1 as a queue consumer
 worker_index.py              entrypoint: step 2 as a queue consumer
@@ -60,6 +60,10 @@ rag_embeddings/
     parse.py                 step 1, batch over a directory
     index.py                 step 2, batch over the cache
     search.py                the read side: embed a query, rank chunks
+  api/
+    app.py                   the service: model and pool, built once at startup
+    routes.py                POST /search
+    schemas.py               the wire contract
   queues/
     base.py                  the Queue interface + consume/retry/dead-letter
     memory.py                backend: in-process, for tests
@@ -92,7 +96,11 @@ on the smallest and most-replicated container in the fan-out.
 docker compose up -d db                      # postgres + pgvector, schema applied
 docker compose run --rm parse /data/inbox    # step 1
 docker compose run --rm index                # step 2
+docker compose up -d api                     # the read side, on :8000
 ```
+
+The steps are jobs and exit; `api` is a service and stays up. See
+[Querying](#querying).
 
 `./inbox` is mounted read-only at `/data/inbox` and `./cache` holds the parse
 cache, so both steps see the same files you do. Model weights land in a named
@@ -570,10 +578,13 @@ Run it with a question you already know the answer to. It is the only check that
 covers the query path, and a plausible-looking ranking of the wrong passages is
 exactly what a profile mismatch looks like.
 
-That snippet is `search.py`, with the profile check and the formatting added:
+That snippet is `steps/search.py`, with the profile check added, served over
+HTTP by `serve.py`:
 
 ```bash
-docker compose run --rm search "what were the Q3 logistics costs?"
+docker compose up -d api
+curl -s localhost:8000/search -H 'content-type: application/json' \
+     -d '{"query": "what were the Q3 logistics costs?"}'
 ```
 
 ---
@@ -619,29 +630,62 @@ Before building the HNSW index on a large table, raise `maintenance_work_mem`
 
 ## Querying
 
-`search.py` is the read side as a script — one query in, ranked chunks out:
+The read side is a service — one query in, ranked chunks out, over HTTP:
 
 ```bash
-docker compose run --rm search "what were the Q3 logistics costs?"
-docker compose run --rm search "patrimônio líquido em junho" -k 10
-docker compose run --rm search "logistics costs" --window 1     # neighbours too
-docker compose run --rm search "logistics costs" --json         # for a pipe
+docker compose up -d api                                # stays up
+curl -s localhost:8000/search -H 'content-type: application/json' \
+     -d '{"query": "what were the Q3 logistics costs?"}'
+curl -s localhost:8000/search -H 'content-type: application/json' \
+     -d '{"query": "patrimônio líquido em junho", "limit": 10}'
+curl -s localhost:8000/search -H 'content-type: application/json' \
+     -d '{"query": "logistics costs", "window": 1}'     # neighbours too
 
-python search.py "what were the Q3 logistics costs?"            # or locally
+python serve.py                                         # or locally
 ```
 
-It takes the same `--profile` / `--max-tokens` / `--dsn` flags as step 2,
-defaulting from the same environment, which is the point: the query has to be
-embedded by the model that embedded the passages. It cannot enforce that, so it
-checks — a corpus indexed under a `chunk_config` the active profile doesn't
-match logs a warning before the results, and any hit that disagrees is printed
-with `STALE`. Nothing raises, because a profile mismatch never raises; it just
-ranks the wrong passages convincingly.
+Interactive docs, generated from the schemas, are at `localhost:8000/docs`.
 
-Output is one line per hit — cosine distance, uri, page, `ord` — followed by
-the chunk text. Read the distances rather than the top hit alone: they should
-rise smoothly, and everything bunched at ~0 or ~1 means degenerate vectors,
-which is the [previous section's](#checking-that-the-embeddings-landed) check.
+It is a service rather than a script for one reason: the model. `Embedder`
+loads ~2.1 GB, which a one-shot query paid on every invocation and a process
+that stays up pays once, at startup. The database is the same trade in
+reverse — a pool of connections borrowed per request, opened before the
+service reports itself as up so an unreachable database fails the container
+instead of the first query.
+
+It reads the same `RAG_EMBED_PROFILE` / `RAG_DSN` environment as step 2, which
+is the point: the query has to be embedded by the model that embedded the
+passages. It cannot enforce that, so it checks — a corpus indexed under a
+`chunk_config` the active profile doesn't match logs a warning at startup, and
+any hit that disagrees comes back with `"stale": true`. Nothing raises, because
+a profile mismatch never raises; it just ranks the wrong passages convincingly.
+
+```json
+{
+  "query": "what were the Q3 logistics costs?",
+  "profile": "bge-m3/8192/128",
+  "count": 1,
+  "hits": [
+    {
+      "id": 412, "document_id": 7, "ord": 12, "page": 4,
+      "uri": "inbox/report.pdf",
+      "heading_path": ["Q3", "Costs"],
+      "chunk_config": "bge-m3/8192/128",
+      "distance": 0.1873, "stale": false,
+      "text": "Logistics costs fell ..."
+    }
+  ]
+}
+```
+
+Read the distances rather than the top hit alone: they should rise smoothly,
+and everything bunched at ~0 or ~1 means degenerate vectors, which is the
+[previous section's](#checking-that-the-embeddings-landed) check.
+
+The service has its own image, `Dockerfile.api` — the same dependency layers as
+the pipeline image up to the `api` extra, which adds FastAPI and uvicorn and is
+what `docker compose up api` builds. The step scripts are deliberately not in
+it: nothing that answers requests from outside should be able to start a parse.
 
 `-k` is how many chunks come back, not how many documents; a long report can
 own every row. `--window N` prints N chunks either side of each hit, which is

@@ -1,8 +1,12 @@
 # syntax=docker/dockerfile:1
 #
-# One image, two entrypoints. Both steps share the same dependency set, and
-# the image is large enough (torch) that building it twice would cost more than
-# the handful of MB step 1 doesn't use.
+# The pipeline image: the two steps and their queue workers. One image, several
+# entrypoints — they share the same dependency set, and the image is large
+# enough (torch) that building it twice would cost more than the handful of MB
+# step 1 doesn't use.
+#
+# The read side is not here. It is a long-lived service with an HTTP stack of
+# its own, so it has its own image: see Dockerfile.api.
 #
 #   docker build -t rag-embeddings .
 #   docker run --rm -v ./cache:/cache -v ./inbox:/data/inbox:ro \
@@ -84,7 +88,7 @@ RUN if [ "$PREFETCH_MODELS" = "1" ]; then \
     fi
 
 COPY rag_embeddings ./rag_embeddings
-COPY step1_parse.py step2_index.py search.py ./
+COPY step1_parse.py step2_index.py ./
 # The same two steps as queue consumers, plus the producer that feeds them.
 COPY worker_parse.py worker_index.py enqueue.py ./
 
