@@ -175,3 +175,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     # Draining without handling anything successfully is different: that is a
     # bad mount or a bad config, and it should be loud.
     return 0 if stats.received == 0 or stats.acked else 1
+
+
+# See enqueue.py: runnable as a module, so the container needs no install step
+# for its entrypoint to resolve. `rag-parse-worker` runs the same main().
+if __name__ == "__main__":
+    raise SystemExit(main())

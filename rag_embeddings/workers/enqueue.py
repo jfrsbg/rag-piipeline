@@ -169,3 +169,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     for item in published:
         print(item)
     return 0
+
+
+# `python -m rag_embeddings.workers.enqueue` is the invocation that needs
+# nothing installed — only the source tree on sys.path, which is what both the
+# container and a checkout have. `rag-enqueue` runs the same main().
+if __name__ == "__main__":
+    raise SystemExit(main())

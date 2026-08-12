@@ -11,12 +11,12 @@
 #   docker build -t rag-embeddings .
 #   # publish work, then leave the services up to consume it
 #   docker run --rm -v queue:/queue -v ./inbox:/data/inbox:ro \
-#              rag-embeddings enqueue.py files /data/inbox
+#              rag-embeddings -m rag_embeddings.workers.enqueue files /data/inbox
 #   docker run -d -v ./cache:/cache -v queue:/queue -v ./inbox:/data/inbox:ro \
-#              rag-embeddings worker_parse.py
+#              rag-embeddings -m rag_embeddings.workers.parse_worker
 #   docker run -d -v ./cache:/cache -v queue:/queue -v hf-models:/models \
 #              -e RAG_DSN=postgresql://postgres:postgres@db/docs \
-#              rag-embeddings worker_index.py
+#              rag-embeddings -m rag_embeddings.workers.index_worker
 #
 # GPU build: --build-arg TORCH_EXTRA=cu126
 
@@ -91,20 +91,20 @@ RUN if [ "$PREFETCH_MODELS" = "1" ]; then \
     fi
 
 COPY rag_embeddings ./rag_embeddings
-# The two queue consumers, plus the producer that feeds them.
-COPY worker_parse.py worker_index.py enqueue.py ./
 
-# Installs the project itself against the deps already present above. Also puts
-# the `rag-parse-worker` / `rag-index-worker` / `rag-enqueue` console scripts on
-# PATH, which the files above shadow rather than replace.
+# Installs the project itself against the deps already present above, which is
+# also what puts the `rag-enqueue` / `rag-parse-worker` / `rag-index-worker`
+# console scripts on PATH. The entrypoints below do not go through them: `-m`
+# against the copied source is one less thing between the container and the
+# `main()` it is meant to run.
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv sync --locked --extra ${TORCH_EXTRA}
 
 RUN mkdir -p /cache/parsed /models /queue
 
 # Both consumers block on an empty queue and never exit on their own, so a
-# container started from this image is expected to be long-lived. The entrypoint
-# file is the argument: neither service is the image's "default" one, and the
-# help text is the only thing safe to run without knowing which was meant.
+# container started from this image is expected to be long-lived. The module is
+# the argument: neither service is the image's "default" one, and the help text
+# is the only thing safe to run without knowing which was meant.
 ENTRYPOINT ["python"]
-CMD ["worker_parse.py", "--help"]
+CMD ["-m", "rag_embeddings.workers.parse_worker", "--help"]

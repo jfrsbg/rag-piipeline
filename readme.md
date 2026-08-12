@@ -37,9 +37,6 @@ message. Nothing walks a directory and runs to completion — see
 ## Layout
 
 ```
-enqueue.py                   entrypoint: publish work onto a queue (a job)
-worker_parse.py              entrypoint: step 1 as a service
-worker_index.py              entrypoint: step 2 as a service
 serve.py                     entrypoint: the search API (FastAPI)
 rag_embeddings/
   config.py                  env -> Settings, the only place os.environ is read
@@ -78,8 +75,12 @@ tests/test_wiring.py         producer + both services, no torch, no database
 tests/test_queues.py         the queue contract, run against every backend
 ```
 
-Each entrypoint file does nothing but call `main()` in its module, so the
-container invocation and the importable function never drift apart.
+The producer and the two services have no entrypoint files: each is run as a
+module — `python -m rag_embeddings.workers.parse_worker` — so the container
+invocation and the importable `main()` are the same object and cannot drift
+apart. `pyproject.toml` also declares them as `rag-enqueue`,
+`rag-parse-worker` and `rag-index-worker` for a machine that has the package
+installed.
 
 There is no `steps/index.py` and no batch driver in `steps/parse.py`. What is
 left of the latter is source resolution — turning `inbox/` or `'*.pdf'` into a
@@ -90,7 +91,7 @@ the two functions that parse or load a document, and `workers/__init__.py`
 resolves its exports lazily so importing the producer does not import
 `index_worker` and, through it, torch.
 
-That is worth a number. Importing the `enqueue` entrypoint costs **0.04s and 131
+That is worth a number. Importing `workers.enqueue` costs **0.04s and 131
 modules**; eagerly it was **4.0s and 4513**, the whole of docling and torch, paid
 on the smallest and most-replicated container in the fan-out to put a filename
 on a queue. If you add an import to `cache.py`, `queues/`, or either package
@@ -145,12 +146,12 @@ Without compose:
 ```bash
 docker build -t rag-embeddings .
 docker run --rm -v queue:/queue -v ./inbox:/data/inbox:ro \
-  rag-embeddings enqueue.py files /data/inbox
+  rag-embeddings -m rag_embeddings.workers.enqueue files /data/inbox
 docker run -d -v ./cache:/cache -v queue:/queue -v ./inbox:/data/inbox:ro \
-  rag-embeddings worker_parse.py
+  rag-embeddings -m rag_embeddings.workers.parse_worker
 docker run -d -v ./cache:/cache -v queue:/queue -v hf-models:/models \
   -e RAG_DSN=postgresql://user:pass@host/docs \
-  rag-embeddings worker_index.py
+  rag-embeddings -m rag_embeddings.workers.index_worker
 ```
 
 The image installs the CPU torch wheel by default. For a GPU host:
@@ -175,9 +176,9 @@ image, and is redundant locally where the volume already holds them.
 
 ```bash
 uv sync --extra cpu                     # or --extra cu126 on a GPU host
-uv run enqueue.py files inbox/
-uv run worker_parse.py &
-uv run worker_index.py --dsn postgresql://localhost/docs &
+uv run python -m rag_embeddings.workers.enqueue files inbox/
+uv run python -m rag_embeddings.workers.parse_worker &
+uv run python -m rag_embeddings.workers.index_worker --dsn postgresql://localhost/docs &
 ```
 
 Locally the queue is `./queue` (`RAG_QUEUE_URL` defaults to `file://./queue`),
@@ -187,8 +188,8 @@ To drain and stop instead of leaving them running — which is what you want for
 a one-off backfill or in CI — give them an idle timeout:
 
 ```bash
-RAG_IDLE_TIMEOUT=5 uv run worker_parse.py
-RAG_IDLE_TIMEOUT=5 uv run worker_index.py --dsn postgresql://localhost/docs
+RAG_IDLE_TIMEOUT=5 uv run python -m rag_embeddings.workers.parse_worker
+RAG_IDLE_TIMEOUT=5 uv run python -m rag_embeddings.workers.index_worker --dsn postgresql://localhost/docs
 ```
 
 That is the only thing that makes a service exit on its own. Ctrl-C is the
@@ -199,8 +200,10 @@ First run downloads the Docling layout models and the embedding model (~2 GB for
 BGE-M3). CPU works; a GPU makes the initial backfill hours instead of days.
 
 `uv sync` also puts `rag-enqueue`, `rag-parse-worker`, `rag-index-worker` and
-`rag-serve` in `.venv/bin` — the same `main()` functions the entrypoint files
-call.
+`rag-serve` in `.venv/bin` — the same `main()` functions the `-m` invocations
+above reach, for a shell where typing the module path is the tedious part. They
+need the package importable from the environment rather than from the working
+directory, which is the one way they can fail where `-m` does not.
 
 `uv.lock` is committed and is the single source of truth for versions; the
 `cpu` and `cu126` extras are declared conflicting, so exactly one may be
@@ -273,10 +276,10 @@ one message on `to-parse` per document; whichever `parse-worker` replica is free
 claims it:
 
 ```bash
-python enqueue.py files inbox/                      # a directory
-python enqueue.py files inbox/ --pattern '*.pdf'    # filtered
-python enqueue.py files a.pdf b.pdf 'reports/*.docx'
-python enqueue.py files inbox/ --force              # after a Docling upgrade
+python -m rag_embeddings.workers.enqueue files inbox/                      # a directory
+python -m rag_embeddings.workers.enqueue files inbox/ --pattern '*.pdf'    # filtered
+python -m rag_embeddings.workers.enqueue files a.pdf b.pdf 'reports/*.docx'
+python -m rag_embeddings.workers.enqueue files inbox/ --force              # after a Docling upgrade
 ```
 
 Source resolution lives on the producer side deliberately: a directory walk is
@@ -303,7 +306,7 @@ For object storage, stage the bytes to disk and keep the real location:
 
 ```bash
 aws s3 sync s3://bucket/prefix ./inbox
-python enqueue.py files inbox/ --uri-prefix s3://bucket/prefix
+python -m rag_embeddings.workers.enqueue files inbox/ --uri-prefix s3://bucket/prefix
 ```
 
 That is what ends up in `documents.uri`, while Docling opens the local file. In
@@ -319,9 +322,9 @@ Also published rather than invoked. The parse service announces new documents
 automatically; the commands below are for re-indexing what is already cached:
 
 ```bash
-python enqueue.py cached                 # everything in the cache
-python enqueue.py cached 9f2a...c1 4b81...0e
-python enqueue.py stale                  # only what the profile made stale
+python -m rag_embeddings.workers.enqueue cached                 # everything in the cache
+python -m rag_embeddings.workers.enqueue cached 9f2a...c1 4b81...0e
+python -m rag_embeddings.workers.enqueue stale                  # only what the profile made stale
 ```
 
 Each `index-worker` loads a cached parse, runs both branches, and writes them in
@@ -344,7 +347,7 @@ After changing the profile, find exactly what is stale rather than reprocessing
 everything:
 
 ```bash
-python enqueue.py stale
+python -m rag_embeddings.workers.enqueue stale
 ```
 
 `stale` compares each chunk's stored `chunk_config` against the active profile

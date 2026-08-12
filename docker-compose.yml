@@ -141,7 +141,7 @@ services:
   # --chunks-only` works as written.
   enqueue:
     <<: *app
-    entrypoint: ["python", "enqueue.py"]
+    entrypoint: ["python", "-m", "rag_embeddings.workers.enqueue"]
     command: ["files", "/data/inbox"]
     profiles: ["job"]
 
@@ -149,7 +149,7 @@ services:
   #   docker compose up -d --scale parse-worker=4 parse-worker
   parse-worker:
     <<: *app
-    entrypoint: ["python", "worker_parse.py"]
+    entrypoint: ["python", "-m", "rag_embeddings.workers.parse_worker"]
     command: []
     # A service that outlives its backlog has to outlive a crash too. Only on
     # failure, and bounded: a clean exit now means it was signalled (or given an
@@ -170,7 +170,7 @@ services:
   # replicas the HNSW index on chunks.embedding, not the CPU, is the limit.
   index-worker:
     <<: *app
-    entrypoint: ["python", "worker_index.py"]
+    entrypoint: ["python", "-m", "rag_embeddings.workers.index_worker"]
     command: []
     # As above. The failure this mostly catches is the OOM kill that mem_limit
     # below turns into one dead container, and restarting is only affordable
