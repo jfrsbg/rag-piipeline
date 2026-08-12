@@ -1,8 +1,8 @@
 """
-Argument plumbing shared by both steps.
+Argument plumbing shared by the producer and both services.
 
-Kept out of the step modules so that each step's file is about what the step
-does, and so the flags cannot drift apart between them.
+Kept out of their modules so that each file is about what that process does,
+and so the flags cannot drift apart between them.
 """
 
 from __future__ import annotations
@@ -17,7 +17,7 @@ from .queues.base import DEFAULT_MAX_ATTEMPTS, DEFAULT_VISIBILITY_TIMEOUT
 
 
 def common_parser() -> argparse.ArgumentParser:
-    """A parent parser with the flags both steps understand."""
+    """A parent parser with the flags every entrypoint understands."""
     parser = argparse.ArgumentParser(add_help=False)
 
     env = parser.add_argument_group("environment (all default from env vars)")
@@ -29,7 +29,7 @@ def common_parser() -> argparse.ArgumentParser:
 
 
 def add_profile_args(parser: argparse.ArgumentParser) -> None:
-    """Only step 2 loads a model, so only step 2 takes these."""
+    """Only the index service loads a model, so only it takes these."""
     group = parser.add_argument_group("embedding profile")
     group.add_argument("--profile", help="named profile or HF model id [RAG_EMBED_PROFILE]")
     group.add_argument("--max-tokens", type=int, help="from the model card [RAG_EMBED_MAX_TOKENS]")
@@ -59,15 +59,15 @@ def add_queue_args(parser: argparse.ArgumentParser) -> None:
 
 
 def add_worker_args(parser: argparse.ArgumentParser) -> None:
-    """The knobs that decide when a worker container exits."""
+    """The knobs that decide when a service container exits."""
     group = parser.add_argument_group("worker loop")
     group.add_argument(
         "--idle-timeout",
         type=float,
         default=idle_timeout_from_env(),
-        help="seconds to wait on an empty queue before exiting; unset means "
-             "run forever, which is what a Deployment wants "
-             "[RAG_IDLE_TIMEOUT]",
+        help="seconds to wait on an empty queue before exiting; leave unset — "
+             "a service outlives its backlog. Set it only to drain a queue and "
+             "stop [RAG_IDLE_TIMEOUT]",
     )
     group.add_argument(
         "--max-messages",

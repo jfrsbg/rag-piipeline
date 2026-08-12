@@ -1,19 +1,22 @@
 # syntax=docker/dockerfile:1
 #
-# The pipeline image: the two steps and their queue workers. One image, several
-# entrypoints — they share the same dependency set, and the image is large
-# enough (torch) that building it twice would cost more than the handful of MB
-# step 1 doesn't use.
+# The pipeline image: the producer and the two queue services. One image,
+# several entrypoints — they share the same dependency set, and the image is
+# large enough (torch) that building it twice would cost more than the handful
+# of MB the parse service doesn't use.
 #
-# The read side is not here. It is a long-lived service with an HTTP stack of
-# its own, so it has its own image: see Dockerfile.api.
+# The read side is not here. It is a service with an HTTP stack of its own, so
+# it has its own image: see Dockerfile.api.
 #
 #   docker build -t rag-embeddings .
-#   docker run --rm -v ./cache:/cache -v ./inbox:/data/inbox:ro \
-#              rag-embeddings step1_parse.py /data/inbox
-#   docker run --rm -v ./cache:/cache -v hf-models:/models \
+#   # publish work, then leave the services up to consume it
+#   docker run --rm -v queue:/queue -v ./inbox:/data/inbox:ro \
+#              rag-embeddings enqueue.py files /data/inbox
+#   docker run -d -v ./cache:/cache -v queue:/queue -v ./inbox:/data/inbox:ro \
+#              rag-embeddings worker_parse.py
+#   docker run -d -v ./cache:/cache -v queue:/queue -v hf-models:/models \
 #              -e RAG_DSN=postgresql://postgres:postgres@db/docs \
-#              rag-embeddings step2_index.py
+#              rag-embeddings worker_index.py
 #
 # GPU build: --build-arg TORCH_EXTRA=cu126
 
@@ -88,18 +91,20 @@ RUN if [ "$PREFETCH_MODELS" = "1" ]; then \
     fi
 
 COPY rag_embeddings ./rag_embeddings
-COPY step1_parse.py step2_index.py ./
-# The same two steps as queue consumers, plus the producer that feeds them.
+# The two queue consumers, plus the producer that feeds them.
 COPY worker_parse.py worker_index.py enqueue.py ./
 
 # Installs the project itself against the deps already present above. Also puts
-# the `rag-parse` / `rag-index` console scripts on PATH, which the step files
-# shadow rather than replace.
+# the `rag-parse-worker` / `rag-index-worker` / `rag-enqueue` console scripts on
+# PATH, which the files above shadow rather than replace.
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv sync --locked --extra ${TORCH_EXTRA}
 
 RUN mkdir -p /cache/parsed /models /queue
 
-# The step file is the argument, so neither step is the image's "default" one.
+# Both consumers block on an empty queue and never exit on their own, so a
+# container started from this image is expected to be long-lived. The entrypoint
+# file is the argument: neither service is the image's "default" one, and the
+# help text is the only thing safe to run without knowing which was meant.
 ENTRYPOINT ["python"]
-CMD ["step2_index.py", "--help"]
+CMD ["worker_parse.py", "--help"]

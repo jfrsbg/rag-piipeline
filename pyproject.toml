@@ -38,21 +38,20 @@ dependencies = [
 cpu = ["torch", "torchvision"]
 cu126 = ["torch", "torchvision"]
 
-# The serving stack, kept out of the base set so the batch and worker images —
-# which have no HTTP surface — do not carry it. Dockerfile.api selects it;
-# Dockerfile does not.
+# The serving stack, kept out of the base set so the pipeline image — which has
+# no HTTP surface — does not carry it. Dockerfile.api selects it; Dockerfile
+# does not.
 api = [
     "fastapi>=0.118,<1",
     "uvicorn[standard]>=0.38,<1",
 ]
 
 [project.scripts]
-rag-parse = "rag_embeddings.steps.parse:main"
-rag-index = "rag_embeddings.steps.index:main"
-# The read side: the query path nothing else exercises. A service now, so it
-# takes a port rather than a question — see rag_embeddings/api.
+# The read side: the query path nothing else exercises. A service, so it takes
+# a port rather than a question — see rag_embeddings/api.
 rag-serve = "rag_embeddings.api.app:main"
-# The same two steps, one document per message. See rag_embeddings/workers.
+# The write side: a producer, and the two services that consume what it
+# publishes. There is no batch counterpart — see rag_embeddings/workers.
 rag-enqueue = "rag_embeddings.workers.enqueue:main"
 rag-parse-worker = "rag_embeddings.workers.parse_worker:main"
 rag-index-worker = "rag_embeddings.workers.index_worker:main"

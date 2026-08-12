@@ -16,9 +16,10 @@ def connect(dsn: str):
 def pool(dsn: str, *, min_size: int = 1, max_size: int = 4):
     """The same connection, pooled — what a long-lived process wants.
 
-    A batch step opens one connection and holds it until it exits; a service
-    handles requests concurrently and must not share one across them, so it
-    borrows and returns instead. `configure` is the pool's version of the rule
+    The index service opens one connection and holds it for the life of the
+    container, because it handles one message at a time; the API handles
+    requests concurrently and must not share one across them, so it borrows and
+    returns instead. `configure` is the pool's version of the rule
     above: it runs on each connection the pool opens, including the ones it
     reopens after the database restarts under it.
 

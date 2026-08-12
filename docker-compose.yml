@@ -1,32 +1,34 @@
-# Two ways to run the same pipeline.
+# One way to run the pipeline: everything is a service, and work arrives on a
+# queue.
 #
-# Batch — the steps run to completion over a directory. Simplest thing that
-# works, and still the right thing for a laptop or a backfill:
-#
-#   docker compose up -d db
-#   docker compose run --rm parse /data/inbox
-#   docker compose run --rm index
-#
-# Queued — a producer publishes one message per document and pools of workers
-# consume them, which is the shape that survives being moved to k8s or ECS:
-#
-#   docker compose up -d db
+#   docker compose up -d                       # db, both services, the api
 #   docker compose run --rm enqueue files /data/inbox
-#   docker compose up parse-worker index-worker
 #
-# The workers stay up until they are stopped, so that `up` does not end the
-# moment the backlog drains. `RAG_IDLE_TIMEOUT=5` is the batch shape instead:
-# each exits once its queue has been quiet that long. `--scale parse-worker=4`
-# is the fan-out: nothing coordinates them, the rename in the queue directory
-# does.
+# That is the whole loop. `up` brings the services online and they stay online,
+# blocking on an empty queue; `enqueue` is a one-shot producer that publishes
+# one message per document and exits. Nothing is "run to completion" any more —
+# a drained queue is an idle service, not a finished job, which is the only
+# shape that survives being moved to k8s or ECS unchanged.
 #
-# Anything after the service name is appended to that command's own arguments,
-# so `docker compose run --rm index --tables-only <sha>` works as written.
+# `enqueue` is behind a profile so that `up` does not start it: it is a job, not
+# a service, and it is the one thing here that is meant to exit. `compose run`
+# ignores profiles, which is why the command above still works.
 #
-# Either way, the read side is a service rather than a step — it stays up,
-# holds the model resident and answers HTTP:
+# Scaling is `--scale parse-worker=4`. Nothing coordinates the replicas; the
+# rename in the queue directory does.
 #
-#   docker compose up -d api
+#   docker compose logs -f parse-worker        # watch the backlog drain
+#   docker compose run --rm enqueue cached     # re-index what is already parsed
+#   docker compose run --rm enqueue stale      # rechunk after a profile change
+#
+# To drain and stop rather than stay up — a backfill, or CI — give the services
+# an idle timeout, which is the only thing that makes them exit on their own:
+#
+#   RAG_IDLE_TIMEOUT=5 docker compose up parse-worker index-worker
+#
+# The read side is a service for the same reason: it stays up, holds the model
+# resident and answers HTTP rather than paying a model load per query.
+#
 #   curl -s localhost:8000/search -H 'content-type: application/json' \
 #        -d '{"query": "what were the Q3 logistics costs?"}'
 
@@ -46,10 +48,11 @@ x-app: &app
     # The queue is a directory on a shared volume. Swapping the backend is this
     # one variable — see rag_embeddings/queues/__init__.py.
     RAG_QUEUE_URL: ${RAG_QUEUE_URL:-file:///queue}
-    # Empty means a worker blocks on an empty queue forever, which is what a
-    # Deployment wants. Set it to a number of seconds for the batch shape:
-    # workers then exit once their queue has been quiet that long, so
-    # `compose up` terminates. Ignored by everything that is not a worker.
+    # Empty — the normal case — means a service blocks on an empty queue
+    # forever, which is what `up` and a Deployment both want. Set it to a
+    # number of seconds to drain and stop instead: each service exits once its
+    # queue has been quiet that long, so `compose up` terminates. That is for a
+    # backfill or CI, not for running the pipeline. Ignored by the api.
     RAG_IDLE_TIMEOUT: ${RAG_IDLE_TIMEOUT:-}
     HF_HOME: /models
     # torch takes every core it can see. Packing several workers onto one host
@@ -79,23 +82,6 @@ services:
       interval: 5s
       timeout: 3s
       retries: 10
-
-  # ---------------------------------------------------------------- batch
-
-  # Step 1 — parse and cache. No database dependency by design.
-  parse:
-    <<: *app
-    entrypoint: ["python", "step1_parse.py"]
-    command: ["/data/inbox"]
-
-  # Step 2 — extract and store. Waits for the database to accept connections.
-  index:
-    <<: *app
-    entrypoint: ["python", "step2_index.py"]
-    command: []
-    depends_on:
-      db:
-        condition: service_healthy
 
   # ------------------------------------------------------------------ read
 
@@ -142,27 +128,40 @@ services:
       db:
         condition: service_healthy
 
-  # --------------------------------------------------------------- queued
+  # ----------------------------------------------------------------- write
 
-  # The producer. Also `enqueue cached` to re-index what is already parsed and
-  # `enqueue stale` to rechunk after a profile change — both whole-cache scans,
-  # which is why they live here and not in a worker.
+  # The producer, and the only thing here that is a job rather than a service.
+  # Also `enqueue cached` to re-index what is already parsed and `enqueue stale`
+  # to rechunk after a profile change — both whole-cache scans, which is why
+  # they live here and not in a service that has N replicas.
+  #
+  # The profile keeps `up` from running it. `compose run --rm enqueue ...`
+  # ignores profiles and is how it is meant to be invoked; anything after the
+  # service name is appended to the command below, so `run --rm enqueue cached
+  # --chunks-only` works as written.
   enqueue:
     <<: *app
     entrypoint: ["python", "enqueue.py"]
     command: ["files", "/data/inbox"]
+    profiles: ["job"]
 
   # Step 1's pool. CPU-bound, no database, no model — scale this one freely.
-  #   docker compose up --scale parse-worker=4 parse-worker
+  #   docker compose up -d --scale parse-worker=4 parse-worker
   parse-worker:
     <<: *app
     entrypoint: ["python", "worker_parse.py"]
     command: []
-    # A worker meant to outlive its backlog has to outlive a crash too. Only on
-    # failure, and bounded: a clean exit is the idle timeout doing its job and
-    # must not be undone, and a worker that dies three times on startup is a bad
-    # mount, which a restart loop would hide rather than fix.
+    # A service that outlives its backlog has to outlive a crash too. Only on
+    # failure, and bounded: a clean exit now means it was signalled (or given an
+    # idle timeout) and must not be undone, and a container that dies three
+    # times on startup is a bad mount, which a restart loop would hide rather
+    # than fix.
     restart: on-failure:3
+    # Docling on a large PDF takes longer than the 10s default, and SIGKILL
+    # mid-parse abandons a claimed message until the visibility timeout expires.
+    # SIGTERM is handled: the loop finishes the document in flight, acks it and
+    # exits, so this only has to be longer than one document.
+    stop_grace_period: 120s
     deploy:
       replicas: ${PARSE_WORKERS:-2}
 
@@ -177,6 +176,10 @@ services:
     # below turns into one dead container, and restarting is only affordable
     # because the model is already on the hf-models volume.
     restart: on-failure:3
+    # As above, and for the same reason — one document's embed plus its commit,
+    # not a model load: the model is already resident by the time a stop can
+    # arrive.
+    stop_grace_period: 120s
     # ~2.3 GB of that is the resident fp32 model; the rest is one forward pass,
     # which RAG_EMBED_TOKEN_BUDGET bounds. Unlimited is the wrong default here:
     # an oversized batch then takes the whole Docker VM, and the database with

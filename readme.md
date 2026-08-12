@@ -27,28 +27,28 @@ flowchart LR
 The two steps run as separate processes. Step 1 needs Docling and a disk; step 2
 needs a GPU-ish machine and the database. Neither needs what the other has.
 
-That split is also the fan-out boundary: the same two steps run as pools of
-queue workers, one document per message, without changing what the diagram
-above describes. See [Running it in parallel](#running-it-in-parallel).
+That split is also the fan-out boundary, and it is the only shape the pipeline
+has: each step is a pool of services consuming a queue, one document per
+message. Nothing walks a directory and runs to completion — see
+[Running it in parallel](#running-it-in-parallel).
 
 ---
 
 ## Layout
 
 ```
-step1_parse.py               entrypoint: parse and cache
-step2_index.py               entrypoint: extract and store
+enqueue.py                   entrypoint: publish work onto a queue (a job)
+worker_parse.py              entrypoint: step 1 as a service
+worker_index.py              entrypoint: step 2 as a service
 serve.py                     entrypoint: the search API (FastAPI)
-enqueue.py                   entrypoint: publish work onto a queue
-worker_parse.py              entrypoint: step 1 as a queue consumer
-worker_index.py              entrypoint: step 2 as a queue consumer
 rag_embeddings/
   config.py                  env -> Settings, the only place os.environ is read
   profiles.py                EmbedProfile + the named profiles
   embedder.py                tokenizer, chunker and model, from one profile
   blobstore.py               where the cache lives: local now, object store later
   cache.py                   parse cache and the manifest sidecar
-  cli.py                     flags shared by the steps and the workers
+  cli.py                     flags shared by the producer and both services
+  shutdown.py                SIGTERM -> finish the document in flight, then stop
   extraction/
     tables.py                branch A: tables -> relational rows
     chunks.py                branch B: chunks -> vectors
@@ -57,8 +57,7 @@ rag_embeddings/
     sql.py                   every statement, in one place
     writer.py                write_all(): both branches, one commit
   steps/
-    parse.py                 step 1, batch over a directory
-    index.py                 step 2, batch over the cache
+    parse.py                 what a source string means, for the producer
     search.py                the read side: embed a query, rank chunks
   api/
     app.py                   the service: model and pool, built once at startup
@@ -75,55 +74,83 @@ rag_embeddings/
     index_worker.py          step 2, one document per message
   pipeline.py                ingest / reextract / rechunk, for in-process use
 sql/schema.sql               applied by the db container on first start
-tests/test_wiring.py         both steps and both workers, no torch, no database
+tests/test_wiring.py         producer + both services, no torch, no database
 tests/test_queues.py         the queue contract, run against every backend
 ```
 
-Each entrypoint file does nothing but call `main()` in its step or worker
-module, so the container invocation and the importable function never drift
-apart.
+Each entrypoint file does nothing but call `main()` in its module, so the
+container invocation and the importable function never drift apart.
 
-`rag_embeddings/__init__.py` resolves its exports lazily. Importing
-`rag_embeddings.queues` is all a producer needs to put a filename on a queue,
-and eager exports would have made it pay for docling and torch on the way in —
-on the smallest and most-replicated container in the fan-out.
+There is no `steps/index.py` and no batch driver in `steps/parse.py`. What is
+left of the latter is source resolution — turning `inbox/` or `'*.pdf'` into a
+list of files — which is the producer's job, not a consumer's: a service is
+handed one uri and never enumerates. It is stdlib-only, and so is everything
+else `enqueue` touches: `cache.py` defers its `DocumentConverter` import into
+the two functions that parse or load a document, and `workers/__init__.py`
+resolves its exports lazily so importing the producer does not import
+`index_worker` and, through it, torch.
+
+That is worth a number. Importing the `enqueue` entrypoint costs **0.04s and 131
+modules**; eagerly it was **4.0s and 4513**, the whole of docling and torch, paid
+on the smallest and most-replicated container in the fan-out to put a filename
+on a queue. If you add an import to `cache.py`, `queues/`, or either package
+`__init__`, check it against that.
+
+`rag_embeddings/__init__.py` resolves its exports the same way, and for the same
+reason: importing `rag_embeddings.queues` is all a producer needs to put a
+filename on a queue.
 
 ---
 
 ## Run it with Docker
 
 ```bash
-docker compose up -d db                      # postgres + pgvector, schema applied
-docker compose run --rm parse /data/inbox    # step 1
-docker compose run --rm index                # step 2
-docker compose up -d api                     # the read side, on :8000
+docker compose up -d                         # db, both services, api on :8000
+docker compose run --rm enqueue files /data/inbox
 ```
 
-The steps are jobs and exit; `api` is a service and stays up. See
-[Querying](#querying).
+That is the whole loop. `up` brings the pipeline online and it stays online,
+blocking on an empty queue; `enqueue` publishes one message per document and
+exits. A drained queue is an idle service, not a finished job, so there is
+nothing to re-run when more documents arrive — enqueue them and the pool that
+is already up picks them up. See [Querying](#querying) for the read side.
+
+`enqueue` is the one thing here that is a job rather than a service, so it sits
+behind a compose profile and `up` does not start it. `compose run` ignores
+profiles, which is why the command above works as written.
 
 `./inbox` is mounted read-only at `/data/inbox` and `./cache` holds the parse
-cache, so both steps see the same files you do. Model weights land in a named
-volume — a rebuild does not re-download BGE-M3.
+cache, so every container sees the same files you do. Model weights land in a
+named volume — a rebuild does not re-download BGE-M3.
 
-Arguments after the service name go to the step:
+Arguments after the service name go to the producer:
 
 ```bash
-docker compose run --rm parse /data/inbox --pattern '*.pdf' --force
-docker compose run --rm index --tables-only 9f2a...c1
-docker compose run --rm index --stale
-docker compose run --rm index --max-tokens 1024
+docker compose run --rm enqueue files /data/inbox --pattern '*.pdf' --force
+docker compose run --rm enqueue cached --tables-only 9f2a...c1
+docker compose run --rm enqueue stale
+docker compose logs -f parse-worker          # watch the backlog drain
+```
+
+Scaling is a flag, and stopping is graceful — SIGTERM lets the document in
+flight finish and be acked before the container exits:
+
+```bash
+docker compose up -d --scale parse-worker=4
+docker compose stop parse-worker
 ```
 
 Without compose:
 
 ```bash
 docker build -t rag-embeddings .
-docker run --rm -v ./cache:/cache -v ./inbox:/data/inbox:ro \
-  rag-embeddings step1_parse.py /data/inbox
-docker run --rm -v ./cache:/cache -v hf-models:/models \
+docker run --rm -v queue:/queue -v ./inbox:/data/inbox:ro \
+  rag-embeddings enqueue.py files /data/inbox
+docker run -d -v ./cache:/cache -v queue:/queue -v ./inbox:/data/inbox:ro \
+  rag-embeddings worker_parse.py
+docker run -d -v ./cache:/cache -v queue:/queue -v hf-models:/models \
   -e RAG_DSN=postgresql://user:pass@host/docs \
-  rag-embeddings step2_index.py
+  rag-embeddings worker_index.py
 ```
 
 The image installs the CPU torch wheel by default. For a GPU host:
@@ -148,15 +175,32 @@ image, and is redundant locally where the volume already holds them.
 
 ```bash
 uv sync --extra cpu                     # or --extra cu126 on a GPU host
-uv run step1_parse.py inbox/
-uv run step2_index.py --dsn postgresql://localhost/docs
+uv run enqueue.py files inbox/
+uv run worker_parse.py &
+uv run worker_index.py --dsn postgresql://localhost/docs &
 ```
+
+Locally the queue is `./queue` (`RAG_QUEUE_URL` defaults to `file://./queue`),
+so the two services find each other with no broker to install.
+
+To drain and stop instead of leaving them running — which is what you want for
+a one-off backfill or in CI — give them an idle timeout:
+
+```bash
+RAG_IDLE_TIMEOUT=5 uv run worker_parse.py
+RAG_IDLE_TIMEOUT=5 uv run worker_index.py --dsn postgresql://localhost/docs
+```
+
+That is the only thing that makes a service exit on its own. Ctrl-C is the
+other way out: the first one finishes the document in flight and exits cleanly,
+a second one is taken literally.
 
 First run downloads the Docling layout models and the embedding model (~2 GB for
 BGE-M3). CPU works; a GPU makes the initial backfill hours instead of days.
 
-`uv sync` also puts `rag-parse` and `rag-index` in `.venv/bin` — the same two
-`main()` functions the step files call.
+`uv sync` also puts `rag-enqueue`, `rag-parse-worker`, `rag-index-worker` and
+`rag-serve` in `.venv/bin` — the same `main()` functions the entrypoint files
+call.
 
 `uv.lock` is committed and is the single source of truth for versions; the
 `cpu` and `cu126` extras are declared conflicting, so exactly one may be
@@ -181,9 +225,12 @@ Every knob is a CLI flag with an environment-variable default, resolved once in
 | `RAG_QUEUE_URL` | `--queue-url` | `file://./queue` |
 | `RAG_PARSE_QUEUE` | `--parse-queue` | `to-parse` |
 | `RAG_INDEX_QUEUE` | `--index-queue` | `to-index` |
+| `RAG_IDLE_TIMEOUT` | `--idle-timeout` | unset — never exit |
 
-The last three are read only by the workers and the producer; the two batch
-steps ignore them.
+The queue variables are read by the producer and both services; the API opens
+no queue. `RAG_IDLE_TIMEOUT` is per-container rather than per-deployment, which
+is why it is not on `Settings`: leaving it unset is what makes a service block
+on an empty queue instead of treating a drained backlog as a finish line.
 
 `RAG_EMBED_TOKEN_BUDGET` is the odd one out: it is hardware sizing, not model
 semantics. It caps tokens per forward pass — sequences times padded length —
@@ -221,65 +268,94 @@ profile rather than a flag you have to remember.
 
 ## Step 1 — parse and cache
 
+The work is published, not invoked. `enqueue` decides which files exist and puts
+one message on `to-parse` per document; whichever `parse-worker` replica is free
+claims it:
+
 ```bash
-python step1_parse.py inbox/                      # a directory
-python step1_parse.py inbox/ --pattern '*.pdf'    # filtered
-python step1_parse.py a.pdf b.pdf 'reports/*.docx'
-python step1_parse.py inbox/ --force              # after a Docling upgrade
+python enqueue.py files inbox/                      # a directory
+python enqueue.py files inbox/ --pattern '*.pdf'    # filtered
+python enqueue.py files a.pdf b.pdf 'reports/*.docx'
+python enqueue.py files inbox/ --force              # after a Docling upgrade
 ```
 
-Writes two files per document: `{sha}.json` (the parse) and `{sha}.meta.json`
-(uri, mime, parser version, timestamp). Prints `sha<TAB>uri` per document, so it
-pipes.
+Source resolution lives on the producer side deliberately: a directory walk is
+an enumeration, and a pool of thirty replicas each enumerating the same prefix
+is a scan, not a pipeline. A consumer is handed one uri and never asks how much
+work exists.
 
-The manifest exists because the steps are separate processes. Step 2 only gets a
-sha; rather than have it re-derive the uri from a source that may no longer be
-reachable, step 1 records what it knew at parse time.
+Each service writes two files per document: `{sha}.json` (the parse) and
+`{sha}.meta.json` (uri, mime, parser version, timestamp), then announces the sha
+on `to-index` — after the parse is stored, never before, because the downstream
+consumer may be on another node and will look for it immediately.
 
-Content-addressed and idempotent: re-running over the same bytes is a cache hit,
-so a crashed batch restarts from the top without duplicates or cleanup.
+The manifest exists because the steps are separate processes, usually on
+separate machines. Step 2 only gets a sha; rather than have it re-derive the uri
+from a source that may no longer be reachable, step 1 records what it knew at
+parse time. It also rides on the
+message, so step 2 normally never reads the sidecar at all.
+
+Content-addressed and idempotent: a redelivered message over the same bytes is a
+cache hit, which is what makes at-least-once delivery safe here — no duplicates,
+no cleanup.
 
 For object storage, stage the bytes to disk and keep the real location:
 
 ```bash
 aws s3 sync s3://bucket/prefix ./inbox
-python step1_parse.py inbox/ --uri-prefix s3://bucket/prefix
+python enqueue.py files inbox/ --uri-prefix s3://bucket/prefix
 ```
 
-That is what ends up in `documents.uri`, while Docling opens the local file.
+That is what ends up in `documents.uri`, while Docling opens the local file. In
+production `enqueue files` is replaced by whatever watches the bucket — an S3
+event, a Lambda, a cron over a prefix. It publishes the same message, which is
+why the services do not care which one you use.
 
 ---
 
 ## Step 2 — extract and store
 
+Also published rather than invoked. The parse service announces new documents
+automatically; the commands below are for re-indexing what is already cached:
+
 ```bash
-python step2_index.py                    # everything in the cache
-python step2_index.py 9f2a...c1 4b81...0e
-python step2_index.py --skip-existing    # only what isn't in the database yet
-python step2_index.py --max-tokens 1024  # smaller chunks than the profile ships
+python enqueue.py cached                 # everything in the cache
+python enqueue.py cached 9f2a...c1 4b81...0e
+python enqueue.py stale                  # only what the profile made stale
 ```
 
-Loads each cached parse, runs both branches, and writes them in one transaction
-per document. No parser runs here.
+Each `index-worker` loads a cached parse, runs both branches, and writes them in
+one transaction per document. No parser runs here, and the embedding model is
+loaded once per container rather than once per document — that amortisation is
+the whole reason this is a service.
 
-The branch flags are the reprocessing triggers, and they are why the two
-branches are separate code paths at all:
+Which branches run is carried on the message, not chosen by a flag on the
+process doing the work: a pool has no per-run flags to set. The producer decides,
+and these are the reprocessing triggers that make the two branches separate code
+paths at all:
 
 | Changed | Run | Re-parses? | Loads a model? |
 |---|---|---|---|
-| Extraction logic / table schema | `step2_index.py --tables-only` | no | no |
-| Embedding model, `max_tokens`, chunker | `step2_index.py --chunks-only` | no | yes |
-| Docling version, OCR settings | `step1_parse.py --force` then step 2 | yes | yes |
+| Extraction logic / table schema | `enqueue cached --tables-only` | no | no |
+| Embedding model, `max_tokens`, chunker | `enqueue cached --chunks-only` | no | yes |
+| Docling version, OCR settings | `enqueue files --force` | yes | yes |
 
 After changing the profile, find exactly what is stale rather than reprocessing
 everything:
 
 ```bash
-python step2_index.py --stale --chunks-only --profile bge-m3 --max-tokens 2048
+python enqueue.py stale
 ```
 
-`--stale` compares each chunk's stored `chunk_config` against the active profile
-version, so it catches model swaps and token-limit changes alike.
+`stale` compares each chunk's stored `chunk_config` against the active profile
+version, so it catches model swaps and token-limit changes alike, and publishes
+chunks-only messages — the parse and the tables did not change, and rewriting
+identical table rows costs without buying anything.
+
+Note that `--profile` and `--max-tokens` belong on the *service*, not on
+`enqueue`: the producer selects documents, the consumer decides how they are
+embedded. Set them in the environment (`RAG_EMBED_PROFILE`,
+`RAG_EMBED_MAX_TOKENS`) so the API and `index-worker` cannot disagree.
 
 ### Chunk size without changing models
 
@@ -287,8 +363,7 @@ version, so it catches model swaps and token-limit changes alike.
 `--profile` alongside it:
 
 ```bash
-docker compose run --rm index --max-tokens 1024
-python step2_index.py --max-tokens 1024
+RAG_EMBED_MAX_TOKENS=1024 docker compose up -d index-worker
 ```
 
 BGE-M3 accepts 8192 tokens, which is a ceiling rather than a recommendation —
@@ -301,11 +376,12 @@ The model is unchanged, so the vectors stay comparable in dimension — but not 
 content, because the text that produced them is different. That makes it a
 reprocessing trigger, not a query-time knob: it belongs in the `--chunks-only`
 row of the table above, and every document indexed at the old size is now stale.
-`profile.version` embeds the number (`BAAI/bge-m3@1024-128`), so `--stale` sees
+`profile.version` embeds the number (`BAAI/bge-m3@1024-128`), so `stale` sees
 the change on its own:
 
 ```bash
-docker compose run --rm index --stale --chunks-only --max-tokens 1024
+RAG_EMBED_MAX_TOKENS=1024 docker compose up -d index-worker
+docker compose run --rm enqueue stale
 ```
 
 Set it once and leave it. Half a corpus at 8192 and half at 1024 ranks
@@ -318,9 +394,10 @@ consistent across both hosts and invocations.
 
 ## Running it in parallel
 
-The batch steps walk a directory. The workers are handed one document at a time
-and have no idea how many exist, which is the only difference and the whole
-reason a pool of them can run at once without agreeing on anything.
+This is not a mode — it is how the pipeline runs. Each service is handed one
+document at a time and has no idea how many exist, which is the whole reason a
+pool of them can run at once without agreeing on anything, and the reason there
+is no directory-walking driver left to fall back on.
 
 ```mermaid
 flowchart LR
@@ -353,9 +430,8 @@ so there are fewer of them and `to-index` is where the difference in throughput
 is allowed to pile up. That backlog is the design, not a problem to fix.
 
 ```bash
-docker compose up -d db
+docker compose up -d --scale parse-worker=4
 docker compose run --rm enqueue files /data/inbox     # one message per document
-docker compose up --scale parse-worker=4 parse-worker index-worker
 ```
 
 The producer also re-enqueues work that is already parsed — both are whole-cache
@@ -367,15 +443,24 @@ docker compose run --rm enqueue cached                # re-index everything cach
 docker compose run --rm enqueue stale                 # rechunk after a profile change
 ```
 
-Workers block on an empty queue and run until they are stopped, which is what a
-Deployment wants: `to-index` sitting empty for an hour is a drained backlog, not
-a reason to exit. `--idle-timeout` (or `RAG_IDLE_TIMEOUT`) is the batch shape —
-a worker exits once its queue has been quiet that many seconds, which is what
-makes `compose up` terminate on a laptop:
+Both services block on an empty queue and run until they are stopped, which is
+what a Deployment wants: `to-index` sitting empty for an hour is a drained
+backlog, not a reason to exit. `--idle-timeout` (or `RAG_IDLE_TIMEOUT`) is the
+drain-and-stop shape — a container exits once its queue has been quiet that many
+seconds, which is what makes `compose up` terminate on a laptop or in CI:
 
 ```bash
 RAG_IDLE_TIMEOUT=5 docker compose up parse-worker index-worker
 ```
+
+Stopping them the normal way is graceful. SIGTERM — `compose stop`, a rolling
+update, a scale-down, Ctrl-C — sets a flag rather than ending the process; the
+loop finishes the document in flight, acks it, and exits 0, so the restart
+policy sees a clean stop and not a crash. A second signal is taken literally.
+`stop_grace_period` in compose is set to 120s for both services, which only has
+to exceed one document. Without that, SIGKILL lands mid-parse and the claimed
+message waits out the visibility timeout before anyone retries it — every deploy
+would stall on whatever was in flight.
 
 Note that an idle timeout interacts with `--visibility-timeout` (default 300s):
 a worker that exits while a message is still in flight leaves it in `inflight`,
@@ -795,15 +880,25 @@ python tests/test_wiring.py
 python tests/test_queues.py
 ```
 
-`test_wiring.py` stubs Docling, sentence-transformers and psycopg, then runs
-step 1 into a temp cache and step 2 out of it, asserting the manifest
-round-trip, the statement order inside the transaction, and that
-`--tables-only` never loads a model. It then runs the same work over a queue:
-producer, two parse workers sharing one queue, one index worker — asserting
-that no document is lost or handled twice, that the manifest arrives on the
-message rather than being read off disk, that a missing parse is dead-lettered
-instead of retried forever while the document behind it still gets written, and
-that the model is loaded once per worker rather than once per message.
+`test_wiring.py` stubs Docling, sentence-transformers and psycopg, then drives
+the real entrypoints from argv — producer, parse service, index service, in that
+order against a file-backed queue — so the flags and the console scripts are
+covered along with the manifest round-trip, the statement order inside the
+transaction, and the fact that `--tables-only` never loads a model.
+`--idle-timeout 0` is the only concession to running three services in one
+process.
+
+It then runs the same work as a pool: two parse services sharing one queue and
+one index service, asserting that no document is lost or handled twice, that the
+manifest arrives on the message rather than being read off disk, that a missing
+parse is dead-lettered instead of retried forever while the document behind it
+still gets written, and that the model is loaded once per container rather than
+once per message.
+
+Last it checks shutdown, which is the part a service has and a job does not: a
+stop signal arriving mid-backlog must let the document in flight finish and be
+acked, leave the rest of the queue untouched, and report a signalled exit rather
+than a crash — and SIGTERM must set that flag instead of killing the process.
 
 `test_queues.py` runs one set of assertions against every backend, because that
 is the claim the abstraction makes. It covers FIFO order, claim exclusivity,

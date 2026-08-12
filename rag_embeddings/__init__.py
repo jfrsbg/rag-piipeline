@@ -2,18 +2,20 @@
 Document ingestion: parse once, cache, fan out to tables (relational)
 and chunks (vector), commit both in one transaction.
 
-The pipeline is split into two independently runnable steps:
+The pipeline is two pools of services with a queue between them:
 
-    step 1  parse and cache      rag_embeddings.steps.parse
-    step 2  extract and store    rag_embeddings.steps.index
+    step 1  parse and cache      rag_embeddings.workers.parse_worker
+    step 2  extract and store    rag_embeddings.workers.index_worker
 
-Step 1 never touches the database; step 2 never touches a parser.
+Step 1 never touches the database; step 2 never touches a parser. Both are fed
+one document per message by `workers.enqueue`, and both stay up across an empty
+queue — there is no batch driver that walks a directory, because a process that
+enumerates its own work cannot be replicated. The seams that makes possible are
+`queues` (which broker) and `blobstore` (where the shared cache lives); nothing
+above either one names a backend.
 
-Both steps also exist as queue workers in `rag_embeddings.workers`, which is
-the same work cut one document per message so a pool of containers can run it
-at once. The seams that makes possible are `queues` (which broker) and
-`blobstore` (where the shared cache lives); nothing above either one names a
-backend.
+`pipeline` is the in-process library API — one document, one call, no queue. It
+is for embedding this in something else, not for running the pipeline.
 
 The names below are resolved on first access rather than on import. Eagerly
 importing them would mean `import rag_embeddings.queues` — all a producer

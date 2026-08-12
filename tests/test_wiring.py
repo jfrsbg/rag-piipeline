@@ -1,15 +1,17 @@
 """
-Wiring check for the two steps, with the heavy dependencies stubbed out.
+Wiring check for the pipeline, with the heavy dependencies stubbed out.
 
-Covers step 1 -> cache -> step 2 -> SQL: import paths, CLI flags, the manifest
-round-trip between the two processes, and the statement order inside the
-transaction. Runs in under a second and needs neither torch nor a database,
-which is the point — it is the test you can run on every edit.
+Covers producer -> to-parse -> cache -> to-index -> SQL: import paths, CLI
+flags, the manifest round-trip between the two processes, the statement order
+inside the transaction, and what a stop signal does to work in flight. Runs in
+under a second and needs neither torch nor a database, which is the point — it
+is the test you can run on every edit.
 
     python tests/test_wiring.py
 """
 
 import json
+import signal
 import sys
 import tempfile
 import types
@@ -204,22 +206,39 @@ from rag_embeddings.cache import Manifest, cached_shas         # noqa: E402
 from rag_embeddings.config import Settings                     # noqa: E402
 from rag_embeddings.profiles import resolve                    # noqa: E402
 from rag_embeddings.queues import IndexRequest, open_queue     # noqa: E402
-from rag_embeddings.steps.index import main as index_main      # noqa: E402
-from rag_embeddings.steps.parse import main as parse_main      # noqa: E402
+from rag_embeddings.shutdown import stop_requested             # noqa: E402
 from rag_embeddings.workers import enqueue as producer         # noqa: E402
 from rag_embeddings.workers import index_worker, parse_worker  # noqa: E402
+from rag_embeddings.workers.index_worker import main as index_main   # noqa: E402
+from rag_embeddings.workers.parse_worker import main as parse_main   # noqa: E402
 
 
 def check(work: Path) -> None:
-    inbox, cache = work / "inbox", work / "cache"
+    """The pipeline driven through its entrypoints, as compose starts them.
+
+    Every process here is started from argv rather than by calling a function,
+    so this covers the flags and the console scripts too. `--idle-timeout 0` is
+    the only difference from a running deployment: the services exit when their
+    queue is empty instead of blocking on it, which is what lets one process
+    run all three in sequence.
+    """
+    inbox, cache, queue_root = work / "inbox", work / "cache", work / "queue"
     inbox.mkdir()
     (inbox / "report.pdf").write_bytes(b"%PDF-1.4 fake bytes")
     (inbox / "notes.md").write_text("# hello")
 
-    common = ["--cache-dir", str(cache), "--log-level", "WARNING"]
+    common = [
+        "--cache-dir", str(cache),
+        "--queue-url", f"file://{queue_root}",
+        "--log-level", "WARNING",
+    ]
+    drain = ["--idle-timeout", "0"]
+
+    # -- producer ----------------------------------------------------------
+    assert producer.main([*common, "files", str(inbox)]) == 0
 
     # -- step 1 ------------------------------------------------------------
-    assert parse_main([str(inbox), *common, "--parser-version", "t"]) == 0
+    assert parse_main([*common, *drain, "--parser-version", "t"]) == 0
     names = sorted(p.name for p in cache.iterdir())
     assert len(names) == 4, names                       # parse + manifest each
     assert sum(n.endswith(".meta.json") for n in names) == 2
@@ -228,14 +247,9 @@ def check(work: Path) -> None:
     assert manifest["parser_version"] == "t"
     assert manifest["mime"] in {"application/pdf", "text/markdown"}
 
-    # a second run over the same bytes must not re-parse
-    parsed = len(FakeConverter.calls)
-    parse_main([str(inbox / "report.pdf"), *common])
-    assert len(FakeConverter.calls) == parsed, "cache hit still re-parsed"
-
     # -- step 2, both branches --------------------------------------------
     CONN.log.clear()
-    assert index_main([*common, "--dsn", "x", "--parser-version", "t"]) == 0
+    assert index_main([*common, *drain, "--dsn", "x", "--parser-version", "t"]) == 0
 
     order = [q for q, _ in CONN.log]
     assert order.count("BEGIN") == order.count("COMMIT") == 2
@@ -245,18 +259,29 @@ def check(work: Path) -> None:
     assert any(q.startswith("insert into doc_tables") for q in first)
     assert any(q.startswith("insert into chunks") for q in first)
 
-    # -- step 2, one branch at a time -------------------------------------
+    # -- one branch at a time ----------------------------------------------
+    # Which branches run is now decided by the producer and carried on the
+    # message, not by a flag on the process doing the work — a pool has no
+    # per-run flags to set.
     CONN.log.clear()
     loaded = len(FakeModel.loaded)
-    index_main([*common, "--dsn", "x", "--tables-only"])
+    assert producer.main([*common, "cached", "--tables-only"]) == 0
+    assert index_main([*common, *drain, "--dsn", "x", "--tables-only"]) == 0
     assert len(FakeModel.loaded) == loaded, "--tables-only loaded a model"
     assert not any("chunks" in q for q, _ in CONN.log)
     assert any("delete from doc_tables" in q for q, _ in CONN.log)
 
     CONN.log.clear()
-    index_main([*common, "--dsn", "x", "--chunks-only"])
+    assert producer.main([*common, "cached", "--chunks-only"]) == 0
+    assert index_main([*common, *drain, "--dsn", "x"]) == 0
     assert not any("doc_tables" in q for q, _ in CONN.log)
     assert any("insert into chunks" in q for q, _ in CONN.log)
+
+    # -- a re-announced document must not be re-parsed ----------------------
+    parsed = len(FakeConverter.calls)
+    assert producer.main([*common, "files", str(inbox / "report.pdf")]) == 0
+    assert parse_main([*common, *drain]) == 0
+    assert len(FakeConverter.calls) == parsed, "cache hit still re-parsed"
 
     # -- library surface ---------------------------------------------------
     for name in ("ingest", "reextract", "rechunk", "stale_documents",
@@ -353,9 +378,58 @@ def check_workers(work: Path) -> None:
     assert to_index.depth() == 3
 
 
+def check_shutdown(work: Path) -> None:
+    """Stopping a service must not cost the document it was working on.
+
+    The signal is only allowed to take effect between messages. Anything else
+    abandons a claimed message for the visibility timeout to reclaim, which
+    turns every deploy into a stall on whatever was in flight.
+    """
+    inbox, cache, queue_root = work / "inbox", work / "cache", work / "queue"
+    inbox.mkdir()
+    for i in range(3):
+        (inbox / f"doc{i}.pdf").write_bytes(f"%PDF-1.4 doc {i}".encode())
+
+    settings = Settings.from_env(
+        cache_dir=str(cache),
+        parser_version="w",
+        dsn="x",
+        queue_url=f"file://{queue_root}",
+    )
+    to_parse = open_queue(settings.queue_url, settings.parse_queue)
+    to_index = open_queue(settings.queue_url, settings.index_queue)
+    assert len(producer.enqueue_files([str(inbox)], settings)) == 3
+
+    # False on the poll before the first message, true from then on — a signal
+    # arriving while the first document is being parsed.
+    checks = {"n": 0}
+
+    def should_stop() -> bool:
+        checks["n"] += 1
+        return checks["n"] > 1
+
+    stats = parse_worker.run(settings, should_stop=should_stop)
+
+    assert stats.stopped, "the loop did not report a signalled exit"
+    assert stats.acked == 1, "the document in flight was not finished"
+    assert to_index.depth() == 1, "the finished document was not announced"
+    assert to_parse.depth() == 2, "the untouched backlog was disturbed"
+
+    # And the signal itself: SIGTERM must set the flag rather than end the
+    # process, and the previous handler must come back afterwards.
+    previous = signal.getsignal(signal.SIGTERM)
+    with stop_requested() as requested:
+        assert not requested()
+        signal.raise_signal(signal.SIGTERM)
+        assert requested(), "SIGTERM did not ask the loop to stop"
+    assert signal.getsignal(signal.SIGTERM) is previous, "handler not restored"
+
+
 if __name__ == "__main__":
     with tempfile.TemporaryDirectory() as tmp:
         check(Path(tmp))
     with tempfile.TemporaryDirectory() as tmp:
         check_workers(Path(tmp))
+    with tempfile.TemporaryDirectory() as tmp:
+        check_shutdown(Path(tmp))
     print("wiring ok")

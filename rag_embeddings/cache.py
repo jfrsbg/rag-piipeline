@@ -1,18 +1,28 @@
 """
 The parse cache: one JSON per content hash, plus a sidecar manifest.
 
-The manifest exists because the two steps run as separate processes. Step 1
-knows the uri and the mime type; step 2 only gets a sha. Rather than making
-step 2 re-derive that from the source (which may no longer be reachable), step 1
-writes it next to the parse.
+The manifest exists because the two steps run as separate processes, usually on
+separate machines. The parse service knows the uri and the mime type; the index
+service only gets a sha. Rather than making it re-derive that from the source
+(which may no longer be reachable), the parse writes it next to the cached
+document.
 
 Every function here takes a `cache_dir` that is really "a cache location": a
 Path, a uri, or a BlobStore. `open_store` normalises it, so the same call works
-against a directory on a laptop and against object storage from a worker, and
-callers never grew a second argument for the difference. When workers pass
-their sha on the queue the manifest also travels in the message — see
-`queues.messages.IndexRequest` — and this sidecar is the fallback for the
-single-machine path that has no queue at all.
+against a directory on a laptop and against object storage in a cluster, and
+callers never grew a second argument for the difference. The manifest also
+travels on the queue message — see `queues.messages.IndexRequest` — so the
+index service normally never reads this sidecar; it is what the in-process
+library API (`pipeline`) and any later re-enqueue read instead.
+
+Nothing docling is imported at module scope, and that is load-bearing rather
+than tidiness. `Manifest` and `cached_shas` are all the producer wants from this
+module, and it is the smallest and most-replicated container in the fan-out;
+importing `DocumentConverter` eagerly made it pay ~3s and the whole of torch to
+put a filename on a queue. The imports therefore sit in the two functions that
+actually parse or load a document, where the process doing it has already
+decided to be a parse service. `DoclingDocument` is only a type here, so it is
+declared under TYPE_CHECKING and quoted where it appears at runtime.
 """
 
 from __future__ import annotations
@@ -23,11 +33,12 @@ import logging
 from dataclasses import dataclass, asdict
 from datetime import datetime, timezone
 from pathlib import Path
-
-from docling.document_converter import DocumentConverter
-from docling_core.types.doc import DoclingDocument
+from typing import TYPE_CHECKING
 
 from .blobstore import BlobStore, LocalBlobStore, open_store
+
+if TYPE_CHECKING:                               # pragma: no cover
+    from docling_core.types.doc import DoclingDocument
 
 log = logging.getLogger(__name__)
 
@@ -90,7 +101,7 @@ class Manifest:
         key = manifest_key(sha)
         if not store.exists(key):
             raise FileNotFoundError(
-                f"no manifest for {sha}; re-run step 1 for this document"
+                f"no manifest for {sha}; re-enqueue the document for parsing"
             )
         return Manifest(**json.loads(store.read_bytes(key)))
 
@@ -122,6 +133,8 @@ def parse_and_cache(
     than merely correct: two workers handed the same document both write, the
     store's rename decides the winner, and the bytes are identical either way.
     """
+    from docling_core.types.doc import DoclingDocument
+
     store = open_store(cache_dir)
     sha = sha256_of(blob)
     key = cache_key(sha)
@@ -131,6 +144,11 @@ def parse_and_cache(
         with store.reading(key) as path:
             return sha, DoclingDocument.load_from_json(path)
 
+    # Imported here rather than at module scope: this line is the only thing in
+    # the file that needs the converter, and importing it costs ~3s and pulls
+    # torch. See the note at the top.
+    from docling.document_converter import DocumentConverter
+
     doc = DocumentConverter().convert(source or uri).document
     with store.writing(key) as path:
         doc.save_as_json(path)
@@ -138,11 +156,15 @@ def parse_and_cache(
     return sha, doc
 
 
-def load_cached(sha: str, cache_dir: CacheLocation) -> DoclingDocument:
+def load_cached(sha: str, cache_dir: CacheLocation) -> "DoclingDocument":
+    from docling_core.types.doc import DoclingDocument
+
     store = open_store(cache_dir)
     key = cache_key(sha)
     if not store.exists(key):
-        raise FileNotFoundError(f"no cached parse for {sha}; re-run step 1")
+        raise FileNotFoundError(
+            f"no cached parse for {sha}; re-enqueue the document for parsing"
+        )
     with store.reading(key) as path:
         return DoclingDocument.load_from_json(path)
 

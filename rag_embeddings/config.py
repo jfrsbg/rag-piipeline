@@ -43,12 +43,14 @@ def _int_env(name: str) -> int | None:
 def idle_timeout_from_env() -> float | None:
     """Seconds a worker waits on an empty queue before exiting; None is forever.
 
-    Not on `Settings`: the batch steps have no loop to bound, and a worker's
-    exit condition is per-container rather than per-deployment. It is read here
-    anyway so that the rule about os.environ living in one module holds.
+    Not on `Settings`: an exit condition is per-container rather than
+    per-deployment — two replicas of the same service may legitimately disagree
+    about it, one draining while the other stays up. It is read here anyway so
+    that the rule about os.environ living in one module holds.
 
-    Unset and empty both mean forever, because that is what a Deployment wants
-    and because `${RAG_IDLE_TIMEOUT:-}` in compose expands to empty.
+    Unset and empty both mean forever, which is the normal case now that the
+    services are the only way work is processed, and also what
+    `${RAG_IDLE_TIMEOUT:-}` in compose expands to.
     """
     raw = os.environ.get("RAG_IDLE_TIMEOUT")
     return float(raw) if raw not in (None, "") else None
@@ -89,7 +91,7 @@ class Settings:
     dsn: str
     profile: EmbedProfile
     embed_token_budget: int = DEFAULT_EMBED_TOKEN_BUDGET
-    # Only the workers read these; the two batch steps ignore them entirely.
+    # Read by the producer and both services; the API never opens a queue.
     queue_url: str = DEFAULT_QUEUE_URL
     parse_queue: str = DEFAULT_PARSE_QUEUE
     index_queue: str = DEFAULT_INDEX_QUEUE

@@ -62,6 +62,10 @@ class ConsumeStats:
     failed: int = 0
     dead_lettered: int = 0
     errors: list[str] = field(default_factory=list)
+    # True when the loop ended because it was signalled rather than because the
+    # queue drained. A service exiting is normally the former, and the two are
+    # worth telling apart in a log when a container disappears unexpectedly.
+    stopped: bool = False
 
     @property
     def ok(self) -> bool:
@@ -117,15 +121,21 @@ class Queue(ABC):
         *,
         timeout: float | None = None,
         interval: float = DEFAULT_POLL_INTERVAL,
+        should_stop: Callable[[], bool] | None = None,
     ) -> Message | None:
         """Receive, waiting up to `timeout` for something to arrive.
 
-        `timeout=None` waits forever, which is what a long-lived worker in a
-        cluster wants; a finite one is what makes a batch container exit when
-        the backlog is drained.
+        `timeout=None` waits forever, which is what a service wants; a finite
+        one is how a container drains a backlog and then exits.
+
+        `should_stop` is checked between polls, so a waiting service reacts to
+        a shutdown signal within one `interval` rather than at the end of a
+        timeout it may never reach.
         """
         deadline = None if timeout is None else time.monotonic() + timeout
         while True:
+            if should_stop is not None and should_stop():
+                return None
             message = self.receive()
             if message is not None:
                 return message
@@ -142,12 +152,18 @@ class Queue(ABC):
         max_attempts: int = DEFAULT_MAX_ATTEMPTS,
         poll_interval: float = DEFAULT_POLL_INTERVAL,
         on_error: Callable[[Message, Exception], None] | None = None,
+        should_stop: Callable[[], bool] | None = None,
     ) -> ConsumeStats:
-        """Run `handler` over messages until the queue goes quiet.
+        """Run `handler` over messages until asked to stop.
 
-        `idle_timeout=None` never returns on its own — the container runs until
-        it is stopped. A number is how a one-shot job drains a backlog and
-        exits, which is also what makes this testable without threads.
+        `idle_timeout=None` never returns on its own — a service runs until it
+        is signalled. A number is how a container drains a backlog and exits,
+        which is also what makes this testable without threads.
+
+        `should_stop` is the signalled case, and is checked only between
+        messages: a shutdown arriving mid-document lets that document finish
+        and be acked, rather than abandoning a claim for the visibility timeout
+        to clean up after the next deploy.
 
         A handler that raises sends the message back for another attempt, and
         the attempt *before* the one that would exceed `max_attempts` is the
@@ -159,8 +175,15 @@ class Queue(ABC):
         stats = ConsumeStats()
 
         while max_messages is None or stats.received < max_messages:
-            message = self.poll(timeout=idle_timeout, interval=poll_interval)
+            message = self.poll(
+                timeout=idle_timeout,
+                interval=poll_interval,
+                should_stop=should_stop,
+            )
             if message is None:
+                # Either the queue stayed quiet for `idle_timeout`, or the poll
+                # was cut short by a signal while it waited.
+                stats.stopped = should_stop is not None and should_stop()
                 break
 
             stats.received += 1
@@ -194,6 +217,10 @@ class Queue(ABC):
             else:
                 stats.acked += 1
                 self.ack(message)
+
+            if should_stop is not None and should_stop():
+                stats.stopped = True
+                break
 
         return stats
 

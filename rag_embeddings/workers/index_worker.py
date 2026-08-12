@@ -1,7 +1,7 @@
 """
-Step 2 as a long-lived worker: claim a sha, extract, store.
+Step 2 as a service: come up, claim a sha, extract, store, repeat.
 
-The reason this is a worker and not a container per document is one line of
+The reason this is a service and not a container per document is one line of
 `Embedder.__init__` — it loads a multi-gigabyte model. Amortised over a pod's
 lifetime that is a startup cost; paid per document it is the pipeline. So the
 model and the connection are built once, before the loop, and the loop itself
@@ -23,7 +23,7 @@ from __future__ import annotations
 
 import argparse
 import logging
-from typing import Any, Sequence
+from typing import Any, Callable, Sequence
 
 from ..cache import load_cached
 from ..cli import (
@@ -40,6 +40,7 @@ from ..embedder import Embedder
 from ..extraction.chunks import build_chunks
 from ..extraction.tables import extract_tables
 from ..queues import ConsumeStats, IndexRequest, Queue, open_queue
+from ..shutdown import stop_requested
 from ..storage.connection import connect
 from ..storage.writer import write_all
 
@@ -54,12 +55,14 @@ def handle(
 ) -> int:
     """One message: one document, one transaction, one commit.
 
-    Deliberately not `steps.index.index_documents` — that builds an Embedder
-    per call, which is exactly the cost this worker exists to pay only once. It
-    also selects work by scanning the cache, and a worker is told what to do.
+    Nothing here selects work. Deciding what needs indexing is a whole-cache or
+    whole-table scan, so it belongs to the producer (`workers.enqueue`) and runs
+    once; a worker is told what to do and does that only. The Embedder is built
+    before the loop for the same reason in reverse — per call it would be the
+    pipeline's dominant cost.
 
     The manifest comes off the message rather than off the cache, so this never
-    reads the sidecar step 1 wrote.
+    reads the sidecar the parse service wrote.
     """
     request = IndexRequest.from_body(body)
     manifest = request.to_manifest()
@@ -102,11 +105,14 @@ def run(
     idle_timeout: float | None = None,
     max_attempts: int = 3,
     visibility_timeout: float | None = None,
+    should_stop: Callable[[], bool] | None = None,
 ) -> ConsumeStats:
-    """Consume `to-index` until it goes quiet.
+    """Consume `to-index`. Returns only when told to stop.
 
     Everything expensive is a parameter with a lazy default, so a test injects
-    fakes and a container builds the real thing — same loop either way.
+    fakes and a container builds the real thing — same loop either way. As with
+    the parse service, an unset `idle_timeout` means an empty queue blocks
+    instead of ending the process.
     """
     settings = settings or Settings.from_env()
     owns_conn = conn is None
@@ -133,6 +139,7 @@ def run(
             max_messages=max_messages,
             idle_timeout=idle_timeout,
             max_attempts=max_attempts,
+            should_stop=should_stop,
         )
     finally:
         if owns_conn:
@@ -141,7 +148,8 @@ def run(
             queue.close()
 
     log.info(
-        "index worker done: %d written, %d failed, %d dead-lettered",
+        "index service %s: %d written, %d failed, %d dead-lettered",
+        "stopped" if stats.stopped else "drained",
         stats.acked, stats.failed, stats.dead_lettered,
     )
     return stats
@@ -166,12 +174,19 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parser.parse_args(argv)
     configure_logging(args.log_level)
 
-    stats = run(
-        settings_from(args),
-        with_chunks=not args.tables_only,
-        max_messages=args.max_messages,
-        idle_timeout=args.idle_timeout,
-        max_attempts=args.max_attempts,
-        visibility_timeout=args.visibility_timeout,
-    )
+    with stop_requested() as should_stop:
+        stats = run(
+            settings_from(args),
+            with_chunks=not args.tables_only,
+            max_messages=args.max_messages,
+            idle_timeout=args.idle_timeout,
+            max_attempts=args.max_attempts,
+            visibility_timeout=args.visibility_timeout,
+            should_stop=should_stop,
+        )
+
+    # As in the parse service: signalled is a clean exit, drained-without-acking
+    # is not. See parse_worker.main for the reasoning.
+    if stats.stopped:
+        return 0
     return 0 if stats.received == 0 or stats.acked else 1
