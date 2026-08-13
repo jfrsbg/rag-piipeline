@@ -66,16 +66,28 @@ def handle(
     """
     request = IndexRequest.from_body(body)
     manifest = request.to_manifest()
+    short = request.sha256[:12]
+
+    # Stage lines, not just start and end: the embedding pass is minutes long
+    # and everything either side of it is milliseconds, so a worker that looks
+    # hung is almost always inside `build_chunks`. Saying so costs three lines
+    # and answers the question without attaching a debugger to a container.
+    log.info("%s: indexing %s", short, request.uri)
     doc = load_cached(request.sha256, settings.cache_dir)
 
-    tables = (
-        extract_tables(doc, document_id=0, parser_version=settings.parser_version)
-        if request.with_tables
-        else None
-    )
-    chunks = (
-        build_chunks(doc, document_id=0, emb=emb) if request.with_chunks else None
-    )
+    tables = None
+    if request.with_tables:
+        tables = extract_tables(
+            doc, document_id=0, parser_version=settings.parser_version
+        )
+        log.info("%s: %d tables", short, len(tables))
+
+    chunks = None
+    if request.with_chunks:
+        log.info("%s: embedding", short)
+        chunks = build_chunks(doc, document_id=0, emb=emb)
+        log.info("%s: %d chunks embedded", short, len(chunks))
+
     if tables is None and chunks is None:
         raise ValueError(f"{request.sha256[:12]}: both branches disabled")
     if chunks is not None and emb is None:
@@ -83,7 +95,7 @@ def handle(
             "message asks for chunks but this worker started with --tables-only"
         )
 
-    return write_all(
+    written = write_all(
         conn,
         request.sha256,
         manifest.uri,
@@ -92,6 +104,8 @@ def handle(
         tables,
         chunks,
     )
+    log.info("%s: committed %d rows", short, written)
+    return written
 
 
 def run(

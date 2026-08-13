@@ -52,6 +52,20 @@ class Message:
     def redelivered(self) -> bool:
         return self.attempts > 1
 
+    @property
+    def label(self) -> str:
+        """Something short enough for a log line and specific enough to grep.
+
+        The receipt alone identifies the delivery but says nothing about the
+        document, and following one document across two queues is the reason
+        anybody reads these lines. Both message types carry a uri; only
+        IndexRequest carries a sha, so this prefers the sha and falls back.
+        """
+        sha = self.body.get("sha256")
+        uri = self.body.get("uri")
+        parts = [p for p in (sha[:12] if isinstance(sha, str) else None, uri) if p]
+        return f"{self.receipt} ({' '.join(parts)})" if parts else self.receipt
+
 
 @dataclass
 class ConsumeStats:
@@ -193,9 +207,19 @@ class Queue(ABC):
                     message.receipt,
                 )
 
+            # One line on the way in and one on the way out, both carrying the
+            # same label: a document that never reaches its "done" line is
+            # either still in the handler or died there, and the pair is what
+            # makes that distinction visible in a container log.
+            log.info("%s: received %s", self.name, message.label)
+            started = time.monotonic()
             try:
                 handler(message.body)
             except Exception as exc:                    # noqa: BLE001
+                log.info(
+                    "%s: failed %s after %.1fs",
+                    self.name, message.label, time.monotonic() - started,
+                )
                 stats.failed += 1
                 stats.errors.append(f"{message.receipt}: {exc}")
                 if on_error is not None:
@@ -215,6 +239,10 @@ class Queue(ABC):
                     )
                     self.nack(message)
             else:
+                log.info(
+                    "%s: done %s in %.1fs",
+                    self.name, message.label, time.monotonic() - started,
+                )
                 stats.acked += 1
                 self.ack(message)
 
