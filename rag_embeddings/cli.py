@@ -9,8 +9,9 @@ from __future__ import annotations
 
 import argparse
 import logging
+import shlex
 
-from .config import Settings, idle_timeout_from_env
+from .config import DispatchSettings, Settings, idle_timeout_from_env
 # From `base` rather than the package, so importing the argument plumbing does
 # not drag in a backend — or, through the message types, docling.
 from .queues.base import DEFAULT_MAX_ATTEMPTS, DEFAULT_VISIBILITY_TIMEOUT
@@ -90,6 +91,58 @@ def add_worker_args(parser: argparse.ArgumentParser) -> None:
     )
 
 
+def add_dispatch_args(parser: argparse.ArgumentParser) -> None:
+    """Only the dispatcher starts containers, so only it takes these."""
+    group = parser.add_argument_group("dispatch")
+    group.add_argument(
+        "--runner-url",
+        help="where tasks run: docker://, process://, ecs://<cluster>/<task-def>, "
+             "k8s://<namespace>, memory:// [RAG_RUNNER_URL]",
+    )
+    group.add_argument("--image", help="parser image [RAG_PARSER_IMAGE]")
+    group.add_argument(
+        "--task-command",
+        help="override the image entrypoint, as one shell-quoted string "
+             "[RAG_TASK_COMMAND]",
+    )
+    group.add_argument(
+        "--task-env",
+        action="append",
+        default=[],
+        metavar="KEY=VALUE",
+        help="extra environment for every task; repeatable [RAG_TASK_ENV]",
+    )
+    group.add_argument("--task-cpu", type=float, help="cores per task [RAG_TASK_CPU]")
+    group.add_argument(
+        "--task-memory", type=int, help="MiB per task [RAG_TASK_MEMORY_MB]"
+    )
+    group.add_argument(
+        "--max-in-flight",
+        type=int,
+        help="containers running at once (default: 4) [RAG_MAX_IN_FLIGHT]",
+    )
+    group.add_argument(
+        "--batch-size", type=int, help="messages claimed per receive [RAG_DISPATCH_BATCH]"
+    )
+    group.add_argument(
+        "--ack-on",
+        choices=["exit", "launch"],
+        help="'exit' holds the message until the container succeeds; 'launch' "
+             "acks as soon as it starts [RAG_ACK_ON]",
+    )
+    group.add_argument(
+        "--task-timeout",
+        type=float,
+        help="seconds before a task is killed and its document retried "
+             "[RAG_TASK_TIMEOUT]",
+    )
+    group.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="use memory:// — print what would be launched, launch nothing",
+    )
+
+
 def settings_from(args: argparse.Namespace) -> Settings:
     return Settings.from_env(
         cache_dir=getattr(args, "cache_dir", None),
@@ -103,6 +156,36 @@ def settings_from(args: argparse.Namespace) -> Settings:
         parse_queue=getattr(args, "parse_queue", None),
         index_queue=getattr(args, "index_queue", None),
     )
+
+
+def dispatch_settings_from(args: argparse.Namespace) -> DispatchSettings:
+    """The dispatch half of the flags. Same rule: `None` means "not passed"."""
+    command = getattr(args, "task_command", None)
+    return DispatchSettings.from_env(
+        runner_url=(
+            "memory://" if getattr(args, "dry_run", False)
+            else getattr(args, "runner_url", None)
+        ),
+        image=getattr(args, "image", None),
+        task_command=shlex.split(command) if command else None,
+        task_env=dict(_env_pairs(getattr(args, "task_env", []) or [])),
+        cpu=getattr(args, "task_cpu", None),
+        memory_mb=getattr(args, "task_memory", None),
+        max_in_flight=getattr(args, "max_in_flight", None),
+        batch_size=getattr(args, "batch_size", None),
+        ack_on=getattr(args, "ack_on", None),
+        task_timeout=getattr(args, "task_timeout", None),
+    )
+
+
+def _env_pairs(items: list[str]) -> list[tuple[str, str]]:
+    pairs = []
+    for item in items:
+        key, sep, value = item.partition("=")
+        if not sep:
+            raise SystemExit(f"--task-env expects KEY=VALUE, got {item!r}")
+        pairs.append((key, value))
+    return pairs
 
 
 def configure_logging(level: str) -> None:

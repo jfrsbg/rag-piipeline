@@ -130,6 +130,26 @@ class Queue(ABC):
     def publish_all(self, bodies: list[Mapping[str, Any]]) -> list[str]:
         return [self.publish(body) for body in bodies]
 
+    def receive_batch(self, max_messages: int = 10) -> list[Message]:
+        """Claim up to `max_messages` at once, or fewer if the queue is thin.
+
+        The default is `receive` in a loop, which is the honest implementation
+        for a backend without a batch call. A broker that has one — SQS's
+        ReceiveMessage takes MaxNumberOfMessages up to 10 — should override
+        this: a batch is one round trip instead of ten, and on SQS it is also
+        one request instead of ten to be billed for.
+
+        Only the dispatcher uses it. A worker handles one document at a time
+        and gains nothing from claiming a second one it cannot start.
+        """
+        batch = []
+        for _ in range(max(0, max_messages)):
+            message = self.receive()
+            if message is None:
+                break
+            batch.append(message)
+        return batch
+
     def poll(
         self,
         *,

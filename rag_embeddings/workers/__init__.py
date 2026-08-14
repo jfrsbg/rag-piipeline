@@ -9,6 +9,13 @@ drains — a backlog is a normal state, not a finish line. Everything a
 container-per-document would rebuild each time (a resident model, a database
 connection) is built once before the loop, and the loop itself holds nothing.
 
+`dispatcher` is the other shape of step 1, for when that argument does not
+hold: instead of a pool of parse workers sharing `to-parse`, one process that
+reads the same queue and starts one parser container per document. Same
+messages, same guarantees — it is a consumer of `to-parse` like any other, and
+which one you run is a deployment choice. Step 2 has no such option, for the
+reason above: its model is the thing you cannot pay for per document.
+
 The names below resolve on first access, for the same reason the top-level
 package does it: importing this package eagerly meant the producer imported
 `index_worker`, which imports `embedder`, which imports torch — several seconds
@@ -28,11 +35,17 @@ _EXPORTS = {
     "enqueue_stale": ".enqueue",
     "run_parse_worker": ".parse_worker",
     "run_index_worker": ".index_worker",
+    "run_dispatcher": ".dispatcher",
+    "Dispatcher": ".dispatcher",
 }
 
-# The two consumers export their loop under one name; `run` is what the module
+# The consumers export their loop under one name; `run` is what each module
 # calls it, and the pool it belongs to is what the caller cares about.
-_ALIASES = {"run_parse_worker": "run", "run_index_worker": "run"}
+_ALIASES = {
+    "run_parse_worker": "run",
+    "run_index_worker": "run",
+    "run_dispatcher": "run",
+}
 
 __all__ = list(_EXPORTS)
 
@@ -56,6 +69,8 @@ def __dir__() -> list[str]:
 
 
 if TYPE_CHECKING:                               # pragma: no cover
+    from .dispatcher import Dispatcher
+    from .dispatcher import run as run_dispatcher
     from .enqueue import enqueue_cached, enqueue_files, enqueue_stale
     from .index_worker import run as run_index_worker
     from .parse_worker import run as run_parse_worker

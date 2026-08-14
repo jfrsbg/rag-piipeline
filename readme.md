@@ -65,14 +65,23 @@ rag_embeddings/
     memory.py                backend: in-process, for tests
     files.py                 backend: a directory, for containers on a volume
     messages.py              ParseRequest and IndexRequest
+  runners/
+    base.py                  the Runner interface + wait/timeout/cancel
+    local.py                 backends: the local Docker daemon, a subprocess
+    ecs.py                   backend: an ECS task
+    kube.py                  backend: a Kubernetes Job
+    memory.py                backend: records launches, starts nothing
   workers/
     enqueue.py               the producer, and the whole-cache coordinator jobs
     parse_worker.py          step 1, one document per message
     index_worker.py          step 2, one document per message
+    dispatcher.py            step 1 the other way: one container per document
+    lambda_dispatch.py       the same loop, as an SQS-triggered Lambda
   pipeline.py                ingest / reextract / rechunk, for in-process use
 sql/schema.sql               applied by the db container on first start
 tests/test_wiring.py         producer + both services, no torch, no database
 tests/test_queues.py         the queue contract, run against every backend
+tests/test_dispatch.py       the dispatcher, and what each runner would start
 ```
 
 The producer and the two services have no entrypoint files: each is run as a
@@ -230,8 +239,26 @@ Every knob is a CLI flag with an environment-variable default, resolved once in
 | `RAG_INDEX_QUEUE` | `--index-queue` | `to-index` |
 | `RAG_IDLE_TIMEOUT` | `--idle-timeout` | unset — never exit |
 
-The queue variables are read by the producer and both services; the API opens
-no queue. `RAG_IDLE_TIMEOUT` is per-container rather than per-deployment, which
+The dispatcher adds a set of its own, read into a separate `DispatchSettings`
+for the reason the API's are separate: none of it reaches the pipeline. A
+document parses to the same bytes whether Docker or Fargate started the
+container, and whether four ran at once or forty.
+
+| Env var | Flag | Default |
+|---|---|---|
+| `RAG_RUNNER_URL` | `--runner-url` | `docker://` |
+| `RAG_PARSER_IMAGE` | `--image` | `rag-embeddings:latest` |
+| `RAG_TASK_COMMAND` | `--task-command` | unset — the image's entrypoint |
+| `RAG_TASK_ENV` | `--task-env` | unset |
+| `RAG_TASK_CPU` | `--task-cpu` | unset — the backend's default |
+| `RAG_TASK_MEMORY_MB` | `--task-memory` | unset |
+| `RAG_MAX_IN_FLIGHT` | `--max-in-flight` | `4` |
+| `RAG_DISPATCH_BATCH` | `--batch-size` | `10` |
+| `RAG_ACK_ON` | `--ack-on` | `exit` (`launch` in Lambda) |
+| `RAG_TASK_TIMEOUT` | `--task-timeout` | `900` |
+
+The queue variables are read by the producer, both services and the
+dispatcher; the API opens no queue. `RAG_IDLE_TIMEOUT` is per-container rather than per-deployment, which
 is why it is not on `Settings`: leaving it unset is what makes a service block
 on an empty queue instead of treating a drained backlog as a finish line.
 
@@ -471,14 +498,17 @@ and the next worker to start reclaims it with an attempt already spent. Short
 idle timeouts and long visibility timeouts can therefore burn a message's
 `--max-attempts` across restarts without it ever being tried properly.
 
-### The two seams
+### The seams
 
-Nothing above them names a backend, so moving to a cluster is configuration:
+Nothing above them names a backend, so moving to a cluster is configuration.
+The third only exists if you run the dispatcher; the first two are the
+pipeline's whatever you run:
 
 | Seam | Today | In a cluster |
 |---|---|---|
 | `RAG_QUEUE_URL` | `file:///queue` — a directory on a shared volume | `sqs://`, `amqp://`, Redis |
 | `RAG_CACHE_DIR` | a bind mount | `s3://bucket/prefix` |
+| `RAG_RUNNER_URL` | `docker://` — the local daemon | `ecs://cluster/task-def`, `k8s://namespace` |
 
 A new queue backend is a `Queue` subclass implementing six transport methods
 and one branch in `open_queue()`. Everything above transport — the receive
@@ -506,6 +536,82 @@ would regress silently.
 The same argument does not apply to step 1, whose models are much smaller. A
 Job per document is defensible there, and is a reasonable escape hatch for
 outliers: one 900-page scan that needs 16 GB should not size every parse pod.
+That shape is built — see [the dispatcher](#the-dispatcher) — and it is a
+choice per deployment, not a replacement: both consume `to-parse`, and nothing
+else in the pipeline can tell which one ran.
+
+### The dispatcher
+
+`rag-dispatcher` reads the same queue the parse workers read and, instead of
+parsing, starts one container per document:
+
+```
+to-parse -> dispatcher -> parser container   (docker | ECS | Kubernetes)
+```
+
+Why you would run it instead of a pool: containers are sized per document
+rather than per deployment, an idle backlog costs one small process instead of
+N parse pods, and the orchestrator — not a `--scale` you remembered to set —
+decides where the work lands. Why you would not: every document now pays a
+container start and an image pull, which for a directory of small PDFs is most
+of the wall clock.
+
+```bash
+# a service, on a laptop, against the local Docker daemon
+rag-dispatcher --queue-url file://./queue \
+  --runner-url 'docker://?volume=/abs/cache:/cache&volume=/abs/queue:/queue' \
+  --image rag-embeddings:latest --max-in-flight 4
+
+# see exactly what it would start, and start nothing
+rag-dispatcher --dry-run --idle-timeout 0
+```
+
+The runner is the third seam, and it works like the other two: the url is the
+only place a backend is named, everything after `?` is placement, and a new
+backend is a `Runner` subclass with two methods plus one branch in
+`open_runner()`. Waiting, timing out and killing an overrunning task are
+written once in `runners/base.py` and inherited.
+
+| `RAG_RUNNER_URL` | what it starts |
+|---|---|
+| `docker://?volume=…&network=…` | a container on the local daemon |
+| `process://` | a child process — no image, for working on the parser |
+| `ecs://<cluster>/<task-def>?subnets=…` | an ECS task (Fargate by default) |
+| `k8s://<namespace>?service_account=…` | a Kubernetes Job, `backoffLimit: 0` |
+| `memory://` | nothing; records what it would have started |
+
+Two things it owns that neither the queue nor the runner does. **One message
+may hold many documents** — a `{"uris": [...]}` batch, or an S3 event
+notification with a `Records` array, which is what a bucket wired straight to
+SQS delivers — and each becomes its own container, `--max-in-flight` at a time.
+Unpacked documents wait in the dispatcher rather than all starting at once,
+which is the difference between a fan-out and a self-inflicted outage. And
+**the message is acked when its documents are**: `--ack-on exit` holds the
+claim until every container has exited zero, so a container that dies gets its
+document redelivered; `--ack-on launch` acks as soon as the tasks are accepted,
+which is cheaper and is the default in Lambda, where waiting is billed.
+
+Retries are not reimplemented here. A failed container fails its message, and
+the attempt counting, the redelivery and the dead-lettering are `queues/base.py`
+doing exactly what it does for a worker — including the rule that a message
+retried to `--max-attempts` is parked rather than retried forever. A message
+whose batch is large therefore wants a visibility timeout longer than its
+documents take, or it will be redelivered while its containers are still
+running. That is safe (content hashes, upserts) but it is not free.
+
+The same loop runs as an SQS-triggered Lambda:
+
+```
+handler = rag_embeddings.workers.lambda_dispatch.handler
+```
+
+There is nothing to poll there — the event source mapping has already received
+the batch — so the event *is* the queue, and acking is the return value: every
+message not named in `batchItemFailures` is deleted. Turn on
+**ReportBatchItemFailures** on the event source mapping, or one bad document
+redelivers all ten. The function needs `RAG_RUNNER_URL` set to something that
+is not `docker://` (there is no daemon in a Lambda) and the IAM to use it —
+`ecs:RunTask` and `iam:PassRole` for `ecs://`.
 
 ### Delivery guarantees
 
@@ -881,6 +987,7 @@ comment on `dependencies` in `pyproject.toml`.
 ```bash
 python tests/test_wiring.py
 python tests/test_queues.py
+python tests/test_dispatch.py
 ```
 
 `test_wiring.py` stubs Docling, sentence-transformers and psycopg, then drives
@@ -910,7 +1017,25 @@ that died holding a claim, and dead-lettering — including six threads consumin
 one queue with no coordination, which is the property the whole fan-out rests
 on.
 
-No torch, no database, no broker. Both run in about a second.
+`test_dispatch.py` covers the other shape of step 1. The behaviour that must
+hold whatever starts the container — one container per document, one ack per
+message, a batch of fifty documents respecting `--max-in-flight`, a failed
+container costing a retry and then a park, a launch the orchestrator refused
+costing neither, an overrunning task being killed rather than abandoned, and a
+stop signal leaving nothing running — is asserted against `memory://`, then
+once for real against `process://` with actual child processes and actual exit
+codes. The three backends nobody can run in a test are covered by asserting on
+the call they would make: the `docker run` argv, the `RunTask` kwargs, the Job
+manifest. That is where their bugs live — an environment variable in the wrong
+flag, or `backoffLimit` left at its default so Kubernetes retries a poison
+document as well as the queue does.
+
+It also drives the Lambda entrypoint with a real SQS event, including a message
+that is not JSON and an S3 notification carrying two objects, and asserts the
+partial batch response names exactly the messages that were not dispatched —
+because anything omitted from it is deleted from the queue.
+
+No torch, no database, no broker, no daemon. All three run in about a second.
 
 ---
 

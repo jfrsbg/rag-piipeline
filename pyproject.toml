@@ -54,6 +54,10 @@ rag-serve = "rag_embeddings.api.app:main"
 # publishes. There is no batch counterpart — see rag_embeddings/workers.
 rag-enqueue = "rag_embeddings.workers.enqueue:main"
 rag-parse-worker = "rag_embeddings.workers.parse_worker:main"
+# The other way to run step 1: instead of a pool of workers sharing the queue,
+# one process that turns each message into a container. Same queue, same
+# messages — see rag_embeddings/workers/dispatcher.py.
+rag-dispatcher = "rag_embeddings.workers.dispatcher:main"
 rag-index-worker = "rag_embeddings.workers.index_worker:main"
 
 [tool.setuptools.packages.find]
