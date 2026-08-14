@@ -62,7 +62,14 @@ x-app: &app
   volumes:
     - ./cache:/cache
     - ./inbox:/data/inbox:ro
-    - queue:/queue
+    # A bind mount rather than a named volume, for the same reason ./cache is
+    # one: the queue is the thing you look at when the pipeline misbehaves, and
+    # `docker volume` is a bad place to keep something you want to read. The
+    # messages `enqueue` publishes land in ./queue/to-parse/ready as one JSON
+    # file each, and a stuck document is a file in inflight/ or dead/ that you
+    # can cat. Shared by every service here, which is what makes the fan-out
+    # work — see rag_embeddings/queues/files.py.
+    - ./queue:/queue
     - hf-models:/models
 
 services:
@@ -195,6 +202,6 @@ services:
 volumes:
   pgdata:
   hf-models:
-  # Shared by every worker. On a cluster this is the broker, and the cache
-  # volume beside it is object storage.
-  queue:
+  # The queue is not here: it is ./queue, a bind mount on the anchor above, so
+  # that the messages are readable from the host. On a cluster it is the broker,
+  # and the cache directory beside it is object storage.

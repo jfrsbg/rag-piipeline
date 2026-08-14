@@ -10,11 +10,11 @@
 #
 #   docker build -t rag-embeddings .
 #   # publish work, then leave the services up to consume it
-#   docker run --rm -v queue:/queue -v ./inbox:/data/inbox:ro \
+#   docker run --rm -v ./queue:/queue -v ./inbox:/data/inbox:ro \
 #              rag-embeddings -m rag_embeddings.workers.enqueue files /data/inbox
-#   docker run -d -v ./cache:/cache -v queue:/queue -v ./inbox:/data/inbox:ro \
+#   docker run -d -v ./cache:/cache -v ./queue:/queue -v ./inbox:/data/inbox:ro \
 #              rag-embeddings -m rag_embeddings.workers.parse_worker
-#   docker run -d -v ./cache:/cache -v queue:/queue -v hf-models:/models \
+#   docker run -d -v ./cache:/cache -v ./queue:/queue -v hf-models:/models \
 #              -e RAG_DSN=postgresql://postgres:postgres@db/docs \
 #              rag-embeddings -m rag_embeddings.workers.index_worker
 #
