@@ -82,10 +82,19 @@ ENV HF_HOME=/models \
 # cannot: CI, an air-gapped host, or an image shipped to someone else. Locally
 # the volume already holds them, and a baked /models is shadowed by any mount
 # over it except the first-time initialisation of an empty named volume.
+#
+# The two sets are separately selectable because this image has two consumers
+# that need opposite halves of it: step 1 parses and never embeds, step 2
+# embeds and never parses. `PREFETCH_MODELS=1` alone still bakes both, so the
+# one-arg build documented above is unchanged; setting the layout arg to 0 on
+# top of it is how an index-only image drops the ~0.5 GB it cannot use.
 ARG PREFETCH_MODELS=0
+ARG PREFETCH_LAYOUT_MODELS=${PREFETCH_MODELS}
 ARG PREFETCH_EMBED_MODEL=BAAI/bge-m3
-RUN if [ "$PREFETCH_MODELS" = "1" ]; then \
-      docling-tools models download && \
+RUN if [ "$PREFETCH_LAYOUT_MODELS" = "1" ]; then \
+      docling-tools models download; \
+    fi \
+ && if [ "$PREFETCH_MODELS" = "1" ]; then \
       python -c "import sys; from sentence_transformers import SentenceTransformer; SentenceTransformer(sys.argv[1])" \
              "$PREFETCH_EMBED_MODEL"; \
     fi

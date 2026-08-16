@@ -110,10 +110,18 @@ services:
     build:
       context: .
       dockerfile: Dockerfile.api
-    # No inbox, no queue, no parse cache: this container reads the database and
-    # the model volume, and that is the whole of its access.
-    volumes:
-      - hf-models:/models
+      args:
+        # Baked for the same reason as index-worker, and it matters more here:
+        # a service that has to download 2.1 GB before it can answer its first
+        # request is a slow rollout, not a slow job. Dockerfile.api never
+        # fetches the layout models, so there is no second arg to turn off.
+        PREFETCH_MODELS: ${API_PREFETCH_MODELS:-1}
+    # No inbox, no queue, no parse cache, and now no model volume either: the
+    # weights are in the image, and a mount over /models would shadow them.
+    # This container reads the database, and that is the whole of its access.
+    # Empty rather than absent — dropping the key would inherit the anchor's
+    # four mounts, which is the opposite of what this service wants.
+    volumes: []
     ports:
       - "${RAG_API_PORT:-8000}:8000"
     # Concurrent requests borrow from a pool of this size. Raising it past the
@@ -177,11 +185,33 @@ services:
   # replicas the HNSW index on chunks.embedding, not the CPU, is the limit.
   index-worker:
     <<: *app
+    # The one image here built with the weights baked in. Restated in full
+    # rather than merged: `<<` replaces a mapping key outright, so naming
+    # `args` alone would drop the context. Everything else still comes from
+    # the anchor, so this stays the same image recipe as parse-worker up to
+    # the prefetch layer and shares every dependency layer with it.
+    build:
+      context: .
+      args:
+        PREFETCH_MODELS: ${INDEX_PREFETCH_MODELS:-1}
+        # Step 2 embeds and never parses, so the Docling layout models are
+        # ~0.5 GB this image would carry and never open. Only the embedder.
+        PREFETCH_LAYOUT_MODELS: "0"
     entrypoint: ["python", "-m", "rag_embeddings.workers.index_worker"]
     command: []
+    # No hf-models mount, and that is the point: a mount over /models shadows
+    # the baked weights, which would make the build arg above buy nothing. The
+    # weights are in the image instead, so this service is the one that does
+    # not depend on the volume being warm. Restated for the same reason as
+    # `build` — merging a list key replaces it, it does not append.
+    volumes:
+      - ./cache:/cache
+      - ./inbox:/data/inbox:ro
+      - ./queue:/queue
     # As above. The failure this mostly catches is the OOM kill that mem_limit
     # below turns into one dead container, and restarting is only affordable
-    # because the model is already on the hf-models volume.
+    # because the model is in the image — no volume to be warm, and no
+    # download between the restart and the first embed.
     restart: on-failure:3
     # As above, and for the same reason — one document's embed plus its commit,
     # not a model load: the model is already resident by the time a stop can
