@@ -89,6 +89,18 @@ class TaskSpec:
     # Carried onto the task as labels/tags so a container can be traced back to
     # the message that caused it without reading its logs.
     labels: Mapping[str, str] = field(default_factory=dict)
+    # The document, as `host:container:ro` — the one piece of placement that
+    # comes from the message rather than from the machine, which is why it is
+    # here and the runner's own `volumes` are not. A task is told to parse a
+    # path and the path has to exist for it; on one machine that means a bind
+    # mount of that file, and it is per-document because each task gets its own
+    # message. Empty whenever the uri is remote, because then there is nothing
+    # local to mount and the worker fetches the bytes itself.
+    #
+    # Only the local backends can honour it: ECS and Kubernetes have no host to
+    # mount from, so a document that needs this cannot be dispatched there —
+    # they say so at launch rather than starting a task that cannot find it.
+    mounts: Sequence[str] = ()
 
 
 @dataclass(frozen=True)
@@ -142,6 +154,23 @@ def task_name(hint: str, prefix: str = "parse") -> str:
     suffix = uuid.uuid4().hex[:8]
     room = 63 - len(prefix) - len(suffix) - 2
     return f"{prefix}-{stem[:room].strip('-') or 'doc'}-{suffix}"
+
+
+def refuse_mounts(spec: TaskSpec, backend: str) -> None:
+    """Raise if a spec needs a host mount the backend cannot give it.
+
+    For the backends with no host to mount from. A document that only exists on
+    the dispatcher's disk cannot be parsed by a task in a cluster, and the
+    honest failure is here, at launch, rather than a container that starts fine
+    and reports "nothing to parse" — the fix is to put the document somewhere
+    the task can reach, which is a different day's work from a retry.
+    """
+    if spec.mounts:
+        raise RuntimeError(
+            f"{spec.name} needs {list(spec.mounts)} mounted, and {backend} has "
+            f"no host to mount from — the document must be somewhere the task "
+            f"can fetch it (s3://...), not a path on the dispatcher"
+        )
 
 
 class Runner(ABC):

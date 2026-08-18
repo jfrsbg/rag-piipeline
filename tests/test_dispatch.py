@@ -23,7 +23,12 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 from rag_embeddings.config import DispatchSettings, Settings      # noqa: E402
-from rag_embeddings.queues import ParseRequest, open_queue, reset_memory  # noqa: E402
+from rag_embeddings.queues import (                               # noqa: E402
+    ParseRequest,
+    local_path,
+    open_queue,
+    reset_memory,
+)
 from rag_embeddings.runners import (                              # noqa: E402
     RecordingRunner,
     TaskSpec,
@@ -37,6 +42,7 @@ from rag_embeddings.runners.local import DockerRunner, ProcessRunner  # noqa: E4
 from rag_embeddings.workers import lambda_dispatch                # noqa: E402
 from rag_embeddings.workers.dispatcher import (                   # noqa: E402
     Dispatcher,
+    document_mounts,
     documents_in,
     run as dispatch_run,
     spec_builder,
@@ -157,6 +163,43 @@ def check_task_spec(tmp: Path):
     assert task_name("a.pdf") != task_name("a.pdf")
 
 
+def check_document_mounts(tmp: Path):
+    """The container is given the document it was told to parse, and no more."""
+    inbox = tmp / "inbox"
+    inbox.mkdir(exist_ok=True)
+    doc = inbox / "Demonstrações 2T26.pdf"       # the awkward name on purpose
+    doc.write_bytes(b"%PDF-1.4\n")
+    (inbox / "someone-elses.pdf").write_bytes(b"%PDF-1.4\n")
+
+    mounts = document_mounts(ParseRequest(uri=str(doc)))
+    assert mounts == (f"{doc}:{doc}:ro",), mounts
+    assert str(inbox) not in [m.split(":")[0] for m in mounts], (
+        "mounting the directory hands the task every other document in it"
+    )
+    # Same path either side: the uri in the message is the uri the worker opens,
+    # so nothing has to translate host paths into container paths.
+    host, container, mode = mounts[0].rsplit(":", 2)
+    assert host == container == str(doc) and mode == "ro"
+
+    # A remote uri is not a missing mount, it is a fetch — and the same
+    # `local_path` says so on both sides of the container boundary.
+    assert document_mounts(ParseRequest(uri="s3://bucket/a.pdf")) == ()
+    assert local_path("s3://bucket/a.pdf") is None
+    assert local_path(f"file://{doc}") == doc, "file:// is a local uri too"
+
+    # Neither of these can be mounted, and neither may take the dispatcher
+    # down: the document fails on its own and the queue does the rest.
+    assert document_mounts(ParseRequest(uri="inbox/relative.pdf")) == ()
+    assert document_mounts(ParseRequest(uri=str(inbox / "gone.pdf"))) == ()
+
+    # And the mount reaches the spec, which is the only thing the runner sees.
+    spec = spec_builder(
+        settings_for(tmp),
+        DispatchSettings.from_env(runner_url="memory://", image="parser:1"),
+    )(ParseRequest(uri=str(doc)))
+    assert list(spec.mounts) == [f"{doc}:{doc}:ro"]
+
+
 # ------------------------------------------------------------------- routing
 
 def check_open_runner(tmp: Path):
@@ -225,6 +268,29 @@ def check_backend_calls():
         cpu=2, memory_mb=4096,
         labels={"rag.doc": "s3://b/a.pdf"},
     )
+
+    local = TaskSpec(
+        name="parse-local-pdf-1234",
+        image="parser:1",
+        env={"RAG_DOC_URI": "/inbox/a.pdf"},
+        mounts=("/inbox/a.pdf:/inbox/a.pdf:ro",),
+    )
+    volumes = DockerRunner(volumes=["/cache:/cache"]).argv(local)
+    volumes = [volumes[i + 1] for i, a in enumerate(volumes) if a == "--volume"]
+    assert volumes == ["/cache:/cache", "/inbox/a.pdf:/inbox/a.pdf:ro"], volumes
+
+    # No host to mount from. Refusing at launch fails the one document loudly;
+    # launching anyway gives a task that starts fine and cannot find its input.
+    for runner, backend in (
+        (EcsRunner("prod", "parse-task", subnets=["subnet-a"]), "ECS"),
+        (KubernetesRunner("parsing"), "Kubernetes"),
+    ):
+        try:
+            runner.launch(local)
+        except RuntimeError as exc:
+            assert backend in str(exc) and "s3://" in str(exc), exc
+        else:
+            raise AssertionError(f"{backend} accepted a task it cannot mount for")
 
     argv = DockerRunner(volumes=["/cache:/cache"], network="rag").argv(spec)
     assert argv[:4] == ["docker", "run", "--detach", "--name"]
@@ -575,6 +641,7 @@ if __name__ == "__main__":
             tmp = Path(raw)
             check_unpacking()
             check_task_spec(tmp)
+            check_document_mounts(tmp)
             check_open_runner(tmp)
             check_backend_calls()
             check_fan_out(tmp)

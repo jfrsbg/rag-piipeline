@@ -217,10 +217,13 @@ def check(work: Path) -> None:
     """The pipeline driven through its entrypoints, as compose starts them.
 
     Every process here is started from argv rather than by calling a function,
-    so this covers the flags and the console scripts too. `--idle-timeout 0` is
-    the only difference from a running deployment: the services exit when their
-    queue is empty instead of blocking on it, which is what lets one process
-    run all three in sequence.
+    so this covers the flags and the console scripts too.
+
+    Step 1 is invoked the way the dispatcher invokes it — `--uri` per document,
+    one process each, exiting when that document is done. Step 2 is still a
+    service, and `--idle-timeout 0` is the only difference from a running
+    deployment: it exits when its queue is empty instead of blocking on it,
+    which is what lets one process run everything here in sequence.
     """
     inbox, cache, queue_root = work / "inbox", work / "cache", work / "queue"
     inbox.mkdir()
@@ -238,7 +241,20 @@ def check(work: Path) -> None:
     assert producer.main([*common, "files", str(inbox)]) == 0
 
     # -- step 1 ------------------------------------------------------------
-    assert parse_main([*common, *drain, "--parser-version", "t"]) == 0
+    # One process per document, exactly as `dispatcher.task_argv` writes it.
+    step1 = [*common, "--parser-version", "t"]
+    for name in ("report.pdf", "notes.md"):
+        assert parse_main([*step1, "--uri", str(inbox / name)]) == 0
+
+    # A worker with no document must refuse rather than exit zero having
+    # parsed nothing — that would have the dispatcher ack a lost document.
+    try:
+        parse_main(step1)
+    except SystemExit as exit_code:
+        assert exit_code.code != 0, "a worker with no document exited clean"
+    else:
+        raise AssertionError("a parse worker with no document must not run")
+
     names = sorted(p.name for p in cache.iterdir())
     assert len(names) == 4, names                       # parse + manifest each
     assert sum(n.endswith(".meta.json") for n in names) == 2
@@ -278,9 +294,10 @@ def check(work: Path) -> None:
     assert any("insert into chunks" in q for q, _ in CONN.log)
 
     # -- a re-announced document must not be re-parsed ----------------------
+    # The parse cache is keyed on the content hash, which is what makes a
+    # redelivered message cost a container start and no work.
     parsed = len(FakeConverter.calls)
-    assert producer.main([*common, "files", str(inbox / "report.pdf")]) == 0
-    assert parse_main([*common, *drain]) == 0
+    assert parse_main([*step1, "--uri", str(inbox / "report.pdf")]) == 0
     assert len(FakeConverter.calls) == parsed, "cache hit still re-parsed"
 
     # -- library surface ---------------------------------------------------
@@ -328,11 +345,17 @@ def check_workers(work: Path) -> None:
     assert len(producer.enqueue_files([str(inbox)], settings)) == 3
     assert to_parse.depth() == 3, "producer published one message per document"
 
-    # -- step 1 workers ----------------------------------------------------
-    # Two of them, sharing the queue with no coordination, exactly as two pods
-    # sharing a volume would. idle_timeout=0 is what makes them exit.
-    first = parse_worker.run(settings, idle_timeout=0.0)
-    second = parse_worker.run(settings, idle_timeout=0.0)
+    # -- step 1 jobs -------------------------------------------------------
+    # A parse worker is a job: it is handed one message body and parses that
+    # one document. Claiming, acking and redelivery are the queue's, which is
+    # precisely what the dispatcher leans on — so draining `to-parse` here and
+    # calling run() per message is the dispatched path with only the container
+    # boundary missing. idle_timeout=0 is what makes each drain end.
+    def parse(body: dict) -> str:
+        return parse_worker.run(body, settings)
+
+    first = to_parse.consume(parse, idle_timeout=0.0)
+    second = to_parse.consume(parse, idle_timeout=0.0)
     assert first.acked + second.acked == 3, "documents were lost or duplicated"
     assert second.received == 0, "the drained queue handed out a message twice"
     assert to_parse.depth() == 0
@@ -379,11 +402,15 @@ def check_workers(work: Path) -> None:
 
 
 def check_shutdown(work: Path) -> None:
-    """Stopping a service must not cost the document it was working on.
+    """Stopping a consumer must not cost the document it was working on.
 
     The signal is only allowed to take effect between messages. Anything else
     abandons a claimed message for the visibility timeout to reclaim, which
     turns every deploy into a stall on whatever was in flight.
+
+    Driven through `Queue.consume` with a parse job as the handler: the loop is
+    the queue's now, and it is the same one the index worker runs. The
+    dispatcher's own loop keeps this property separately — see test_dispatch.
     """
     inbox, cache, queue_root = work / "inbox", work / "cache", work / "queue"
     inbox.mkdir()
@@ -408,7 +435,10 @@ def check_shutdown(work: Path) -> None:
         checks["n"] += 1
         return checks["n"] > 1
 
-    stats = parse_worker.run(settings, should_stop=should_stop)
+    stats = to_parse.consume(
+        lambda body: parse_worker.run(body, settings),
+        should_stop=should_stop,
+    )
 
     assert stats.stopped, "the loop did not report a signalled exit"
     assert stats.acked == 1, "the document in flight was not finished"

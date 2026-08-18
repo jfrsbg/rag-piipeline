@@ -20,7 +20,14 @@ from __future__ import annotations
 import logging
 from typing import Any, Sequence
 
-from .base import Runner, TaskHandle, TaskResult, TaskSpec, TaskState
+from .base import (
+    Runner,
+    TaskHandle,
+    TaskResult,
+    TaskSpec,
+    TaskState,
+    refuse_mounts,
+)
 
 log = logging.getLogger(__name__)
 
@@ -87,6 +94,7 @@ class EcsRunner(Runner):
     # ----------------------------------------------------------- placement
 
     def launch(self, spec: TaskSpec) -> TaskHandle:
+        refuse_mounts(spec, "ECS")
         response = self.client.run_task(**self.run_task_kwargs(spec))
 
         failures = response.get("failures") or []

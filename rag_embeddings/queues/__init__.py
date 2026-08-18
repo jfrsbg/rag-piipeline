@@ -23,7 +23,7 @@ from .base import (
 )
 from .files import FileQueue
 from .memory import InMemoryQueue, reset as reset_memory, shared as shared_memory
-from .messages import IndexRequest, ParseRequest
+from .messages import IndexRequest, ParseRequest, local_path
 
 DEFAULT_QUEUE_URL = "file://./queue"
 
@@ -66,6 +66,7 @@ __all__ = [
     "InMemoryQueue",
     "ParseRequest",
     "IndexRequest",
+    "local_path",
     "open_queue",
     "shared_memory",
     "reset_memory",

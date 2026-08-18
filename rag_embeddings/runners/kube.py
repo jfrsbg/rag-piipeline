@@ -24,7 +24,14 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-from .base import Runner, TaskHandle, TaskResult, TaskSpec, TaskState
+from .base import (
+    Runner,
+    TaskHandle,
+    TaskResult,
+    TaskSpec,
+    TaskState,
+    refuse_mounts,
+)
 
 log = logging.getLogger(__name__)
 
@@ -77,6 +84,7 @@ class KubernetesRunner(Runner):
     # ----------------------------------------------------------- placement
 
     def launch(self, spec: TaskSpec) -> TaskHandle:
+        refuse_mounts(spec, "Kubernetes")
         body = self.job_body(spec)
         job = self.api.create_namespaced_job(namespace=self.namespace, body=body)
         name = _get(job, "metadata", "name") or spec.name

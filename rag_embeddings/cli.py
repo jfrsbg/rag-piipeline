@@ -11,7 +11,12 @@ import argparse
 import logging
 import shlex
 
-from .config import DispatchSettings, Settings, idle_timeout_from_env
+from .config import (
+    DispatchSettings,
+    Settings,
+    idle_timeout_from_env,
+    parse_request_from_env,
+)
 # From `base` rather than the package, so importing the argument plumbing does
 # not drag in a backend — or, through the message types, docling.
 from .queues.base import DEFAULT_MAX_ATTEMPTS, DEFAULT_VISIBILITY_TIMEOUT
@@ -89,6 +94,45 @@ def add_worker_args(parser: argparse.ArgumentParser) -> None:
         help="seconds before a claim held by a dead worker is reclaimed "
              "(default: %(default)s)",
     )
+
+
+def add_document_args(parser: argparse.ArgumentParser) -> None:
+    """One document, named on the command line: the parse worker's job mode.
+
+    These are the arguments `dispatcher.task_argv` writes, and the only reason
+    they exist. Given `--uri` the worker parses that document and exits;
+    without it, it falls back to consuming `to-parse` as a service.
+    """
+    group = parser.add_argument_group("one document (job mode)")
+    group.add_argument(
+        "--uri",
+        help="parse this document and exit, instead of consuming a queue "
+             "[RAG_DOC_URI / RAG_PARSE_REQUEST]",
+    )
+    group.add_argument("--mime", help="content type, if the name does not say")
+    group.add_argument("--uri-prefix", help="rewrite the stored uri under this prefix")
+    group.add_argument(
+        "--force",
+        action="store_true",
+        default=None,
+        help="re-parse even if the cache already holds this content",
+    )
+
+
+def document_body_from(args: argparse.Namespace) -> dict | None:
+    """The message body the worker was handed, from argv or the environment.
+
+    `None` means it was handed nothing and should run as a service. The flags
+    win over the environment, as everywhere else here.
+    """
+    if getattr(args, "uri", None):
+        return {
+            "uri": args.uri,
+            "mime": getattr(args, "mime", None),
+            "uri_prefix": getattr(args, "uri_prefix", None),
+            "force": bool(getattr(args, "force", None)),
+        }
+    return parse_request_from_env()
 
 
 def add_dispatch_args(parser: argparse.ArgumentParser) -> None:

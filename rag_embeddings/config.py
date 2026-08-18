@@ -8,11 +8,12 @@ CLI flags override the environment; the environment overrides the defaults.
 
 from __future__ import annotations
 
+import json
 import os
 import shlex
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Mapping, Sequence
+from typing import Any, Mapping, Sequence
 
 from .profiles import EmbedProfile, resolve
 # From `runners.base` rather than the package, and only for the constant: the
@@ -44,7 +45,7 @@ DEFAULT_API_POOL_SIZE = 4
 # from the queues package — this module is the list of what the environment can
 # set, and it should read as one.
 DEFAULT_RUNNER_URL = "docker://"
-DEFAULT_PARSER_IMAGE = "rag-embeddings:latest"
+DEFAULT_PARSER_IMAGE = "parse-worker:latest"
 DEFAULT_MAX_IN_FLIGHT = 4
 DEFAULT_BATCH_SIZE = 10
 
@@ -73,6 +74,34 @@ def idle_timeout_from_env() -> float | None:
     """
     raw = os.environ.get("RAG_IDLE_TIMEOUT")
     return float(raw) if raw not in (None, "") else None
+
+
+def parse_request_from_env() -> dict[str, Any] | None:
+    """The one document a dispatched container was started for, if any.
+
+    A parse worker is a job now: the dispatcher claims the message and hands
+    the container its contents, so the container never opens `to-parse` itself.
+    `None` means nothing was handed over — the caller falls back to the service
+    loop, which is still how a worker is run without a dispatcher in front.
+
+    Two spellings because `spec_builder` sends both and neither is more true
+    than the other: the whole request as JSON, and the fields apart for an
+    entrypoint that is a shell script rather than this module. JSON wins when
+    both are set, being the one that cannot lose a field it did not know about.
+    """
+    raw = os.environ.get("RAG_PARSE_REQUEST")
+    if raw:
+        return json.loads(raw)
+
+    uri = os.environ.get("RAG_DOC_URI")
+    if not uri:
+        return None
+    return {
+        "uri": uri,
+        "mime": os.environ.get("RAG_DOC_MIME") or None,
+        "uri_prefix": os.environ.get("RAG_DOC_URI_PREFIX") or None,
+        "force": os.environ.get("RAG_DOC_FORCE", "") not in ("", "0"),
+    }
 
 
 @dataclass(frozen=True)
@@ -121,9 +150,11 @@ class DispatchSettings:
     # What to run. Ignored by `ecs://` (the image is in the task definition)
     # and by `process://` (there is no image).
     image: str = DEFAULT_PARSER_IMAGE
-    # Empty means "whatever the image's entrypoint is", which is the right
-    # default: the container decides how it is started, and the dispatcher only
-    # decides which document it is started for.
+    # Empty — the normal case — means the dispatcher builds the command from
+    # the message: `-m rag_embeddings.workers.parse_worker --uri ...`, appended
+    # to the image's `python` entrypoint. See `dispatcher.task_argv`. Set it
+    # only for an image that starts differently; that image then finds the
+    # document in RAG_PARSE_REQUEST instead of in its arguments.
     task_command: tuple[str, ...] = ()
     task_env: dict[str, str] = field(default_factory=dict)
     cpu: float | None = None

@@ -19,8 +19,10 @@ failed and the queue redelivers the message — see `runners/base.py`.
 
 from __future__ import annotations
 
+import json
 import logging
 import os
+import re
 import shlex
 import subprocess
 import sys
@@ -45,10 +47,14 @@ CLI_TIMEOUT = 60.0
 class DockerRunner(Runner):
     """One container per document, on the local daemon.
 
-    `volumes` and `network` are placement, not payload, which is why they are
-    on the runner and come from the url rather than from a TaskSpec: the parse
-    container needs the cache and the queue directory mounted, and where those
-    live on the host is a property of this machine.
+    `volumes` and `network` are the machine's half of placement, which is why
+    they are on the runner and come from the url: the parse container needs the
+    cache and the queue directory mounted, and where those live on the host is
+    a property of this machine, not of any document.
+
+    The document itself is the other half and arrives per task, as
+    `TaskSpec.mounts` — see there. Both end up as `--volume`, the runner's
+    first so that a spec cannot quietly shadow the cache.
     """
 
     backend = "docker"
@@ -154,7 +160,11 @@ class DockerRunner(Runner):
         argv += ["--label", DISPATCH_LABEL]
         for key, value in spec.labels.items():
             argv += ["--label", f"{key}={value}"]
-        for volume in self.volumes:
+        # The machine's mounts, then the message's. The cache and the queue are
+        # the same for every task this dispatcher starts; the document is not,
+        # and it is mounted at the path the message named so that the uri the
+        # worker is given is the uri it can open.
+        for volume in (*self.volumes, *spec.mounts):
             argv += ["--volume", volume]
         if self.network:
             argv += ["--network", self.network]
@@ -210,6 +220,13 @@ class ProcessRunner(Runner):
                 "--task-command, e.g. --task-command 'python -m "
                 "rag_embeddings.workers.parse_worker'"
             )
+        # The dispatcher's default command is arguments to `python`, because
+        # the image's entrypoint is `python`. There is no image here, so this
+        # backend supplies that entrypoint itself — and it has to be *this*
+        # interpreter, not whatever `python` resolves to on PATH.
+        argv = list(spec.command)
+        if argv[0].startswith("-"):
+            argv = default_python_command() + argv
         # The child inherits this process's environment so that PATH, HOME and
         # the virtualenv still work; the spec's variables win where they
         # overlap, because those are the ones naming the document.
@@ -218,7 +235,7 @@ class ProcessRunner(Runner):
         handle_file = stream.open("wb")
         try:
             process = subprocess.Popen(
-                list(spec.command), env=env, cwd=self.cwd,
+                argv, env=env, cwd=self.cwd,
                 stdout=handle_file, stderr=subprocess.STDOUT,
             )
         finally:

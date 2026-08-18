@@ -62,7 +62,14 @@ from ..cli import (
     settings_from,
 )
 from ..config import DispatchSettings, Settings
-from ..queues import DEFAULT_MAX_ATTEMPTS, Message, ParseRequest, Queue, open_queue
+from ..queues import (
+    DEFAULT_MAX_ATTEMPTS,
+    Message,
+    ParseRequest,
+    Queue,
+    local_path,
+    open_queue,
+)
 from ..queues.base import DEFAULT_POLL_INTERVAL
 from ..runners import (
     DEFAULT_STATUS_INTERVAL,
@@ -141,22 +148,103 @@ def _s3_documents(records: Iterable[Mapping[str, Any]]) -> list[ParseRequest]:
 
 # ------------------------------------------------------------ task building
 
+# What a dispatched container runs. Arguments to `python`, not a command line:
+# the image's ENTRYPOINT is the interpreter, so this is what Docker appends
+# after it, what Kubernetes sends as `args` and what ECS sends as the command
+# override — one string in three places, which is the point of not naming the
+# interpreter here.
+PARSE_MODULE = "rag_embeddings.workers.parse_worker"
+
+
+def task_argv(request: ParseRequest) -> tuple[str, ...]:
+    """One document -> the arguments the container is started with.
+
+    The message the dispatcher consumed, spelled as flags. `parse_worker` takes
+    exactly these and parses that one document; see `cli.add_document_args`.
+
+    The same fields also ride in the environment (`spec_builder` below), and
+    both are sent on purpose: this is the readable half — the document a
+    container is parsing is in `docker ps` and in `kubectl get job -o yaml`,
+    not only in an env var someone has to go and inspect.
+    """
+    argv = ["-m", PARSE_MODULE, "--uri", request.uri]
+    if request.mime:
+        argv += ["--mime", request.mime]
+    if request.uri_prefix:
+        argv += ["--uri-prefix", request.uri_prefix]
+    if request.force:
+        argv.append("--force")
+    return tuple(argv)
+
+
+def document_mounts(request: ParseRequest) -> tuple[str, ...]:
+    """The one document a task may see, as `TaskSpec.mounts`.
+
+    A message names a document by uri and the container has to be able to open
+    that uri. For a local one that means a bind mount, and it is the file
+    itself rather than the directory holding it: a task is given one document
+    and mounting its inbox would hand it every other document as well.
+
+    Mounted at the same absolute path it has on this machine, which is what
+    makes the message enough on its own — no translation table between host
+    paths and container paths, and the uri stored in the manifest is the uri
+    the operator enqueued.
+
+    Nothing is mounted, and that is not a failure, when:
+
+      * the uri is remote (`s3://...`) — the worker fetches it itself, and this
+        is the whole of what changes here when that lands;
+      * the file is not on this machine — `docker run -v` would silently create
+        an empty directory at that path, which is a worse failure than the
+        clear one the worker already raises;
+      * the uri is relative — there is no absolute path to mount it at, and
+        the container's working directory is not the dispatcher's.
+
+    The last two are the operator's mistake rather than the document's, so they
+    are logged here: without the line, the only symptom is a container failing
+    with "nothing to parse" at a path that plainly exists.
+    """
+    path = local_path(request.uri)
+    if path is None:
+        return ()                       # remote: the worker will fetch it
+
+    if not path.is_absolute():
+        log.warning(
+            "%s is a relative path; a container cannot be given one — enqueue "
+            "absolute paths, or an s3:// uri", request.uri,
+        )
+        return ()
+    if not path.exists():
+        log.warning("%s is not on this machine; dispatching it anyway", request.uri)
+        return ()
+    return (f"{path}:{path}:ro",)
+
+
 def spec_builder(
     settings: Settings, dispatch: DispatchSettings
 ) -> Callable[[ParseRequest], TaskSpec]:
     """Make the function that turns one document into one container spec.
 
-    The container is told which document it owns three ways, because the
-    contract with it is not settled yet and each costs nothing:
+    The container is told which document it owns three ways, and all three are
+    read by the worker at the other end:
 
-        RAG_DOC_URI / RAG_DOC_MIME / ...   the fields, for a shell entrypoint
+        the command                        `-m ...parse_worker --uri ...`
         RAG_PARSE_REQUEST                  the whole message, as JSON
-        the command, if one is configured  for an image that takes arguments
+        RAG_DOC_URI / RAG_DOC_MIME / ...   the fields, for a shell entrypoint
+
+    The command is the one that normally does it, and `task_argv` builds it
+    from the message. A configured `--task-command` replaces it outright rather
+    than being appended to — an image with its own entrypoint is being told
+    "start like this", and it still finds the document in the environment.
 
     Everything else in the environment is what the parser already reads from
     it — cache directory, parser version, the queue it announces onto — passed
     through unchanged so that a container started here and a container started
     by compose are configured identically.
+
+    Naming the document three ways is no use if the container cannot reach it,
+    so the spec also carries the mount that puts it there — `document_mounts`
+    above, and the reason the operator does not configure an inbox volume.
     """
 
     def build(request: ParseRequest) -> TaskSpec:
@@ -186,11 +274,12 @@ def spec_builder(
         return TaskSpec(
             name=task_name(request.uri),
             image=dispatch.image,
-            command=dispatch.task_command,
+            command=dispatch.task_command or task_argv(request),
             env=env,
             cpu=dispatch.cpu,
             memory_mb=dispatch.memory_mb,
             labels={"rag.doc": request.uri[-120:]},
+            mounts=document_mounts(request),
         )
 
     return build

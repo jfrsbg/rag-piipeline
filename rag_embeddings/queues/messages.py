@@ -17,10 +17,36 @@ queue to carry anything.
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Mapping
+from urllib.parse import unquote, urlparse
 
 if TYPE_CHECKING:                                    # pragma: no cover
     from ..cache import Manifest
+
+# Schemes that name a file on whichever machine is reading the message. Bare
+# paths have no scheme at all, which is what `enqueue files` writes.
+LOCAL_SCHEMES = ("", "file")
+
+
+def local_path(uri: str) -> Path | None:
+    """The file a uri names on this machine, or None if it names a remote one.
+
+    One function because two things ask the question and their answers must
+    match: the dispatcher mounts what this returns into the parse container,
+    and the worker inside that container opens it. If they disagreed the
+    container would be handed a document at a path it does not look at.
+
+    None is the seam for a remote scheme. `s3://bucket/key` returns it on both
+    sides, which is exactly right for both: nothing to mount, because the
+    worker will fetch the bytes itself.
+    """
+    parsed = urlparse(uri)
+    if parsed.scheme not in LOCAL_SCHEMES or parsed.netloc:
+        return None
+    # A bare path is not a url and must not be unquoted: "Q3%20report.pdf" is a
+    # real filename. Only file:// carries percent-encoding.
+    return Path(unquote(parsed.path) if parsed.scheme else uri)
 
 
 @dataclass(frozen=True)

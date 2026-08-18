@@ -1,19 +1,27 @@
 # syntax=docker/dockerfile:1
 #
-# The pipeline image: the producer and the two queue services. One image,
-# several entrypoints — they share the same dependency set, and the image is
-# large enough (torch) that building it twice would cost more than the handful
-# of MB the parse service doesn't use.
+# The pipeline image: the producer, the dispatcher, the parse job and the index
+# service. One image, several entrypoints — they share the same dependency set,
+# and the image is large enough (torch) that building it twice would cost more
+# than the handful of MB each entrypoint doesn't use. The two model sets are
+# separately bakeable (see PREFETCH_* below), which is the split that actually
+# saves anything: an index-only image drops the layout models, a parse-only one
+# drops the embedder, and both stay one recipe.
 #
 # The read side is not here. It is a service with an HTTP stack of its own, so
 # it has its own image: see Dockerfile.api.
 #
 #   docker build -t rag-embeddings .
-#   # publish work, then leave the services up to consume it
+#   # publish work
 #   docker run --rm -v ./queue:/queue -v ./inbox:/data/inbox:ro \
 #              rag-embeddings -m rag_embeddings.workers.enqueue files /data/inbox
-#   docker run -d -v ./cache:/cache -v ./queue:/queue -v ./inbox:/data/inbox:ro \
-#              rag-embeddings -m rag_embeddings.workers.parse_worker
+#   # one document, one container, then gone — what the dispatcher starts
+#   docker run --rm -v ./cache:/cache -v ./queue:/queue -v ./inbox:/data/inbox:ro \
+#              rag-embeddings -m rag_embeddings.workers.parse_worker \
+#              --uri /data/inbox/a.pdf
+#   # the dispatcher itself: drains the queue by starting the above, N at a time
+#   docker run --rm -v /var/run/docker.sock:/var/run/docker.sock -v ./queue:/queue \
+#              rag-embeddings -m rag_embeddings.workers.dispatcher
 #   docker run -d -v ./cache:/cache -v ./queue:/queue -v hf-models:/models \
 #              -e RAG_DSN=postgresql://postgres:postgres@db/docs \
 #              rag-embeddings -m rag_embeddings.workers.index_worker
@@ -111,9 +119,17 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 
 RUN mkdir -p /cache/parsed /models /queue
 
-# Both consumers block on an empty queue and never exit on their own, so a
-# container started from this image is expected to be long-lived. The module is
-# the argument: neither service is the image's "default" one, and the help text
-# is the only thing safe to run without knowing which was meant.
+# `python` and nothing more, because the module is the argument. That is what
+# lets one image be four entrypoints, and it is the contract the dispatcher
+# builds against: it appends `-m rag_embeddings.workers.parse_worker --uri ...`
+# to this, which is a command on Docker, `args` on Kubernetes and a command
+# override on ECS — the same three tokens in all three, precisely because the
+# interpreter is here and not there. See rag_embeddings/workers/dispatcher.py.
+#
+# A parse container started that way is a job: it parses its one document and
+# exits, and the dispatcher removes it. Run with no arguments the same module
+# is a service instead, blocking on `to-parse` forever, which is also what the
+# index worker does. Since neither is the image's "default", the help text is
+# the only thing safe to run without knowing which was meant.
 ENTRYPOINT ["python"]
 CMD ["-m", "rag_embeddings.workers.parse_worker", "--help"]

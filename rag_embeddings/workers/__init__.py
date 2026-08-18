@@ -1,20 +1,27 @@
 """
-The pipeline's write path: a producer and two pools of long-lived consumers.
+The pipeline's write path: a producer, a dispatcher, and one long-lived pool.
 
-    enqueue.files  ->  to-parse  ->  parse_worker  ->  to-index  ->  index_worker
+    enqueue.files -> to-parse -> dispatcher -> parse_worker (a job, per document)
+                                                   |
+                                                   v
+                                               to-index -> index_worker (a pool)
 
-There is no batch counterpart. Both consumers are services that come up with the
-deployment and stay up, blocking on an empty queue rather than exiting when it
-drains — a backlog is a normal state, not a finish line. Everything a
-container-per-document would rebuild each time (a resident model, a database
-connection) is built once before the loop, and the loop itself holds nothing.
+The two steps are deliberately different shapes, because the thing that decides
+the shape is what a container has to build before it can do any work.
 
-`dispatcher` is the other shape of step 1, for when that argument does not
-hold: instead of a pool of parse workers sharing `to-parse`, one process that
-reads the same queue and starts one parser container per document. Same
-messages, same guarantees — it is a consumer of `to-parse` like any other, and
-which one you run is a deployment choice. Step 2 has no such option, for the
-reason above: its model is the thing you cannot pay for per document.
+Step 1 builds nothing worth keeping, so it is a job. The dispatcher consumes
+`to-parse` and starts one `parse_worker` container per document, passing it the
+message it just claimed; that container parses its document, publishes onto
+`to-index` and exits. Nothing waits on an empty queue, and the number of
+parsers tracks the backlog rather than the deployment.
+
+Step 2 is a pool of services for the opposite reason: a resident embedding
+model and a database connection are exactly what you cannot afford to rebuild
+per document, so `index_worker` comes up with the deployment, blocks on an
+empty `to-index` and stays up when it drains.
+
+Both halves are the same messages and the same guarantees either way — a claim
+is held until the work is accounted for, and the queue owns retries.
 
 The names below resolve on first access, for the same reason the top-level
 package does it: importing this package eagerly meant the producer imported
@@ -39,8 +46,10 @@ _EXPORTS = {
     "Dispatcher": ".dispatcher",
 }
 
-# The consumers export their loop under one name; `run` is what each module
-# calls it, and the pool it belongs to is what the caller cares about.
+# Each module calls its entrypoint `run`, and which worker it belongs to is
+# what the caller cares about. `run_parse_worker` is the odd one: it takes a
+# message body and parses one document, where the other two take settings and
+# loop — the difference between a job and a service, at the seam.
 _ALIASES = {
     "run_parse_worker": "run",
     "run_index_worker": "run",
