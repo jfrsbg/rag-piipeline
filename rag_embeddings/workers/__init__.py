@@ -1,34 +1,7 @@
 """
-The pipeline's write path: a producer, a dispatcher, and one long-lived pool.
-
-    enqueue.files -> to-parse -> dispatcher -> parse_worker (a job, per document)
-                                                   |
-                                                   v
-                                               to-index -> index_worker (a pool)
-
-The two steps are deliberately different shapes, because the thing that decides
-the shape is what a container has to build before it can do any work.
-
-Step 1 builds nothing worth keeping, so it is a job. The dispatcher consumes
-`to-parse` and starts one `parse_worker` container per document, passing it the
-message it just claimed; that container parses its document, publishes onto
-`to-index` and exits. Nothing waits on an empty queue, and the number of
-parsers tracks the backlog rather than the deployment.
-
-Step 2 is a pool of services for the opposite reason: a resident embedding
-model and a database connection are exactly what you cannot afford to rebuild
-per document, so `index_worker` comes up with the deployment, blocks on an
-empty `to-index` and stays up when it drains.
-
-Both halves are the same messages and the same guarantees either way — a claim
-is held until the work is accounted for, and the queue owns retries.
-
-The names below resolve on first access, for the same reason the top-level
-package does it: importing this package eagerly meant the producer imported
-`index_worker`, which imports `embedder`, which imports torch — several seconds
-and a few thousand modules to put a filename on a queue, paid by the smallest
-and most-replicated container in the fan-out. Importing a submodule directly
-(`from rag_embeddings.workers import enqueue`) is unaffected either way.
+The write path: enqueue -> to-parse -> dispatcher -> parse_worker -> to-index
+-> index_worker. Exports resolve on first access so that importing this package
+does not drag in `index_worker` and, through it, torch.
 """
 
 from __future__ import annotations

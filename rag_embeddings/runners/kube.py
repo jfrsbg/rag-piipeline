@@ -1,22 +1,6 @@
 """
-Kubernetes: one Job per document.
-
-A Job rather than a bare Pod, because a Pod that is evicted — a spot node going
-away, a drained node — is simply gone, and nothing would ever tell the
-dispatcher. A Job with `backoffLimit: 0` is the narrowest thing that still
-records a terminal outcome: exactly one Pod, one attempt, and a status the
-dispatcher can read after the fact.
-
-`backoffLimit: 0` is the important line. Kubernetes will happily retry a failed
-Pod six times with a backoff, and if it did, a poison document would be
-attempted six times per delivery and three deliveries later would finally
-dead-letter — twenty minutes after the operator expected it. Retries belong to
-the queue, which already counts them.
-
-The client is imported inside `api`, for the same reason boto3 is in `ecs.py`.
-The Job is built as a plain dict rather than through the V1* model classes:
-it is the same JSON either way, and a dict is one import instead of eight and
-is readable in a test assertion.
+Kubernetes: one Job per document, `backoffLimit: 0` so the cluster never
+retries. Jobs are built as plain dicts and the client is imported lazily.
 """
 
 from __future__ import annotations
@@ -133,17 +117,12 @@ class KubernetesRunner(Runner):
                 log.warning("k8s: could not delete job %s: %s", handle.id, exc)
 
     def cleanup(self, handle: TaskHandle) -> None:
-        """Nothing: `ttlSecondsAfterFinished` is the cluster doing this for us.
-
-        Deleting the Job here would work too, and would also delete the Pod
-        whose logs are the only explanation of a failure, at the exact moment
-        someone wants them.
-        """
+        """Nothing: `ttlSecondsAfterFinished` has the cluster reap the Job."""
 
     # --------------------------------------------------------------- private
 
     def job_body(self, spec: TaskSpec) -> dict[str, Any]:
-        """The Job manifest, built where a test can assert on it."""
+        """Build the Job manifest for `spec`."""
         container: dict[str, Any] = {
             "name": "parser",
             "image": spec.image,
@@ -200,7 +179,7 @@ class KubernetesRunner(Runner):
 
 
 def _get(obj: Any, *path: str) -> Any:
-    """Read a field from either a V1* model or the dict a fake returns."""
+    """Read a field from either a V1* model or a plain dict."""
     for key in path:
         if obj is None:
             return None
@@ -221,12 +200,7 @@ def _failure_reason(job: Any) -> str:
 
 
 def _label_safe(labels: Any) -> dict[str, str]:
-    """Kubernetes label values are 63 chars of [-A-Za-z0-9_.]; a uri is not.
-
-    Dropping what does not fit is better than failing the Job creation: these
-    are for finding a Pod by eye, and a document whose uri is too long still
-    has to be parsed.
-    """
+    """Drop labels whose value is not 63 chars of [-A-Za-z0-9_.]."""
     out = {}
     for key, value in dict(labels or {}).items():
         text = str(value)

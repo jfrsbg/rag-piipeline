@@ -1,5 +1,5 @@
-"""Connection factory. register_vector() is what makes list[float] bind to
-`vector`, so it has to happen on every connection, not once per process."""
+"""Connection factory. register_vector() must run on every connection for
+list[float] to bind to `vector`."""
 
 from __future__ import annotations
 
@@ -14,17 +14,9 @@ def connect(dsn: str):
 
 
 def pool(dsn: str, *, min_size: int = 1, max_size: int = 4):
-    """The same connection, pooled — what a long-lived process wants.
+    """Build a connection pool for a long-lived process.
 
-    The index service opens one connection and holds it for the life of the
-    container, because it handles one message at a time; the API handles
-    requests concurrently and must not share one across them, so it borrows and
-    returns instead. `configure` is the pool's version of the rule
-    above: it runs on each connection the pool opens, including the ones it
-    reopens after the database restarts under it.
-
-    Returned unopened. The caller decides when connecting is allowed to fail,
-    which for the API is startup rather than the first request.
+    Returned unopened: the caller decides when connecting may fail.
     """
     from psycopg_pool import ConnectionPool
 

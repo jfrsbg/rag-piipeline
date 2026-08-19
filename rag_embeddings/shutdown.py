@@ -1,20 +1,6 @@
-"""
-Stopping a service without losing the document it was working on.
-
-A batch job could be killed at any point and simply re-run. A service cannot:
-`docker compose stop`, a rolling update and a scale-down all arrive as SIGTERM
-in the middle of whatever the container happens to be doing, and Python's
-default handler ends the process there — mid-parse, with a message still
-claimed. Nothing is lost (the claim expires and the message is redelivered),
-but every deploy then pays a visibility timeout before that document is retried.
-
-So the signal sets a flag instead. The consume loop checks it between messages,
-finishes the one in flight, acks it, and returns — which is a clean exit, not a
-crash, and so does not trip the restart policy.
-
-The second signal is deliberately not swallowed: if a document is genuinely
-stuck, an operator pressing Ctrl-C twice means it, and waiting for a grace
-period they have already given up on helps nobody.
+"""Graceful shutdown: a stop signal sets a flag the consume loop checks between
+messages, so the document in flight is finished and acked. A second signal is
+not swallowed — it kills the process as usual.
 """
 
 from __future__ import annotations
@@ -33,11 +19,7 @@ STOP_SIGNALS = (signal.SIGTERM, signal.SIGINT)
 
 @contextmanager
 def stop_requested() -> Iterator[Callable[[], bool]]:
-    """Yield a predicate that becomes true once a stop signal arrives.
-
-    Restores the previous handlers on the way out, so importing this into a
-    test or a notebook does not permanently change how the process dies.
-    """
+    """Yield a predicate that becomes true once a stop signal arrives."""
     flagged = False
 
     def requested() -> bool:

@@ -1,19 +1,7 @@
 """
-The producer, and the coordinator jobs that are not a worker's business.
-
-Two things live here because they are the same thing — deciding what work
-exists — and because that decision is centralised on purpose. A worker is
-handed one document and never enumerates: `cached_shas` and the staleness query
-are whole-cache and whole-table scans, and running either from thirty replicas
-at once is how a scan becomes an outage.
-
-    enqueue files    inbox/            -> to-parse    (new documents)
-    enqueue cached                     -> to-index    (cache exists, rows do not)
-    enqueue stale                      -> to-index    (profile changed, rechunk)
-
-In production `files` is replaced by whatever watches object storage — an S3
-event, a Lambda, a cron over a prefix. It publishes the same message either
-way, which is why the workers do not care which one you use.
+The producer: decide what work exists and publish it onto `to-parse` or
+`to-index`. Centralised on purpose — `cached` and `stale` are whole-cache and
+whole-table scans, which must not run from every worker replica at once.
 """
 
 from __future__ import annotations
@@ -41,11 +29,7 @@ def enqueue_files(
     uri_prefix: str | None = None,
     force: bool = False,
 ) -> list[str]:
-    """One `to-parse` message per file. Returns the uris published.
-
-    Reuses step 1's own source resolution so a directory, a glob and an
-    explicit path mean here exactly what they mean there.
-    """
+    """Publish one `to-parse` message per file and return the uris."""
     settings = settings or Settings.from_env()
     paths = resolve_sources(sources, pattern)
     queue = queue or open_queue(settings.queue_url, settings.parse_queue)
@@ -69,11 +53,7 @@ def enqueue_cached(
     with_tables: bool = True,
     with_chunks: bool = True,
 ) -> list[str]:
-    """One `to-index` message per cached parse.
-
-    The re-entry point after a step 2 change: the parses are already there, so
-    this fans them back out without re-reading a single source document.
-    """
+    """Publish one `to-index` message per cached parse, re-reading no sources."""
     settings = settings or Settings.from_env()
     selected = list(shas) if shas else cached_shas(settings.cache_dir)
     queue = queue or open_queue(settings.queue_url, settings.index_queue)
@@ -96,11 +76,7 @@ def enqueue_stale(
     conn=None,
     queue: Queue | None = None,
 ) -> list[str]:
-    """Documents whose stored chunk_config no longer matches the profile.
-
-    Chunks only: the parse and the tables did not change, so re-running branch
-    A would rewrite identical rows and pay for the privilege.
-    """
+    """Re-chunk documents whose stored chunk_config no longer matches the profile."""
     from ..storage.connection import connect
     from ..storage.writer import stale_shas
 

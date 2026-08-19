@@ -1,17 +1,7 @@
 """
-The service: what the query path used to be as a script.
+FastAPI app for the query path.
 
-The CLI could build everything per invocation — one query, then exit. A
-service cannot. `Embedder` loads a ~2.1 GB model, so it is constructed once in
-the lifespan and held for the life of the process: startup cost paid at
-startup, rather than latency paid on every request. The database is the same
-argument in reverse — connections are cheap enough to borrow per request but
-not per query to open, so they come from a pool.
-
-The profile check runs once here too. It is a property of the corpus, not of a
-query, so checking it per request would log the same warning forever; checking
-it at startup puts it in the first lines of the container's logs, which is
-where you look when the rankings are wrong.
+The embedder, pool and profile check are built once in the lifespan.
 """
 
 from __future__ import annotations
@@ -34,7 +24,7 @@ log = logging.getLogger(__name__)
 
 @dataclass
 class Resources:
-    """Everything a request needs and nothing it should build itself."""
+    """Process-wide resources shared by every request."""
 
     settings: Settings
     pool: object

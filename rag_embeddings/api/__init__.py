@@ -1,14 +1,8 @@
 """
-The read side as an HTTP service.
+The read side as an HTTP service; retrieval itself lives in `steps/search.py`.
 
-`steps/search.py` still does the retrieval — embed the query, rank the chunks,
-flag anything indexed under another profile. This package is only the part
-that turns it into something long-lived: process-wide resources in `app.py`,
-the wire contract in `schemas.py`, one route in `routes.py`.
-
-Imported lazily for the same reason the top-level package defers its exports:
-`import rag_embeddings.api` pulls fastapi and, through the embedder, torch.
-Nothing that is not the service should pay for that.
+Exports are resolved lazily so importing this package does not pull fastapi
+and torch.
 """
 
 from __future__ import annotations

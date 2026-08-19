@@ -1,38 +1,7 @@
 """
-The dispatcher as an SQS-triggered Lambda.
-
-    handler = rag_embeddings.workers.lambda_dispatch.handler
-
-Same loop, same runner, same settings. Two things are different, and both come
-from Lambda rather than from us:
-
-  * the messages are already received. An event source mapping did the
-    ReceiveMessage, so there is nothing to poll and nothing to claim — the
-    batch arrives as the event.
-  * acking is a return value. A message is deleted unless the handler names it
-    in `batchItemFailures`, which is the partial batch response and needs
-    `ReportBatchItemFailures` set on the event source mapping. Without that
-    flag, one bad document in a batch of ten redelivers all ten.
-
-`EventBatch` is what makes that fit behind the same interface: a Queue whose
-messages come from the event and whose ack, nack and dead-letter are a set of
-message ids to report back. The dispatch loop is then the code that is already
-tested rather than a second implementation with its own bugs.
-
-Sizing, in one place, because Lambda is the deployment where it bites:
-
-    RAG_ACK_ON=launch   start the containers and return. The Lambda is billed
-                        for a second or two whatever the parse costs, and a
-                        container that dies takes its document with it.
-    RAG_ACK_ON=exit     hold the batch until the containers exit. Honest
-                        at-least-once, but the function is billed for the whole
-                        parse and must be given a timeout longer than one.
-
-`launch` is the default here for that reason, and `exit` is the default
-everywhere else. Either way the function needs the IAM permissions its runner
-uses — `ecs:RunTask` and `iam:PassRole` for `ecs://`, and nothing at all for
-`docker://`, which cannot work in Lambda and is why `RAG_RUNNER_URL` must be
-set on the function.
+`handler` runs the dispatcher loop over the messages in one SQS event.
+Requires `ReportBatchItemFailures` on the event source mapping, or one bad
+document redelivers the whole batch. `RAG_ACK_ON` defaults to `launch` here.
 """
 
 from __future__ import annotations
@@ -59,11 +28,7 @@ DEADLINE_MARGIN = 15.0
 
 
 class EventBatch(Queue):
-    """The messages in one Lambda event, behind the Queue interface.
-
-    Not registered with `open_queue`: there is no url for "the batch you were
-    handed", and constructing one from anything but an event would be wrong.
-    """
+    """The messages in one Lambda event, behind the Queue interface."""
 
     name = "sqs-event"
 
@@ -99,13 +64,7 @@ class EventBatch(Queue):
 
     @property
     def failures(self) -> list[dict[str, str]]:
-        """The partial batch response: everything not explicitly acked.
-
-        Deliberately a subtraction rather than a list the failure paths append
-        to. A message the loop never reached — because the invocation ran out
-        of time — is not a success, and a response that omitted it would delete
-        a document nothing ever parsed.
-        """
+        """The partial batch response: every message not explicitly acked."""
         return [
             {"itemIdentifier": message_id}
             for message_id in self._ids
@@ -114,12 +73,7 @@ class EventBatch(Queue):
 
 
 def _message(record: Mapping[str, Any]) -> Message:
-    """One SQS record -> one Message.
-
-    `body` is a string on the wire. `ApproximateReceiveCount` is SQS's own
-    attempt counter, which is what lets `max_attempts` mean the same thing here
-    as it does in a polling dispatcher.
-    """
+    """Turn one SQS record into a Message."""
     raw = record.get("body", "")
     if isinstance(raw, Mapping):
         body = dict(raw)                      # already decoded (a test, a fake)
@@ -142,12 +96,7 @@ def _message(record: Mapping[str, Any]) -> Message:
 
 
 def handler(event: Mapping[str, Any], context: Any = None) -> dict[str, Any]:
-    """Dispatch one SQS batch. Returns the partial batch response.
-
-    A direct invocation with a single message body — the console's "Test"
-    button, a one-off `aws lambda invoke` — is accepted too, so the function
-    can be exercised without putting anything on the queue.
-    """
+    """Dispatch one SQS batch and return the partial batch response."""
     records = event.get("Records")
     if records is None:
         log.info("no Records: treating the event as one message body")
@@ -191,13 +140,7 @@ def handler(event: Mapping[str, Any], context: Any = None) -> dict[str, Any]:
 
 
 def _fit_to_deadline(dispatch: DispatchSettings, context: Any) -> DispatchSettings:
-    """Shorten the task timeout so the handler outlives its own tasks.
-
-    Only matters when the handler waits for exits. A task that would otherwise
-    run past the function's timeout is killed just before it, so the loop ends,
-    the batch is reported, and the documents that did parse are not redelivered
-    along with the one that hung.
-    """
+    """Shorten the task timeout so the handler outlives its own tasks."""
     remaining_ms = getattr(context, "get_remaining_time_in_millis", None)
     if not dispatch.waits or remaining_ms is None:
         return dispatch

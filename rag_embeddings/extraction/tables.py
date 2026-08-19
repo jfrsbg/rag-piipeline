@@ -18,9 +18,7 @@ def extract_tables(
     document_id: int,
     parser_version: str,
 ) -> list[dict]:
-    """Reads table_cells, not export_to_dataframe(): the DataFrame export has a
-    known class of bug where a column is silently dropped, while the cell data
-    is intact in the JSON."""
+    """Extract one row per table from the parsed document."""
     rows = []
     for idx, table in enumerate(doc.tables):
         data = table.data

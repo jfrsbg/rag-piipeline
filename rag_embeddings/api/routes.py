@@ -1,11 +1,7 @@
 """
-The one route. Everything it needs was built at startup; this is the part that
-runs per request.
+The /search route.
 
-Declared `def` rather than `async def` on purpose: both halves of a search
-block — the embedding forward pass in torch and the query in psycopg — and
-Starlette runs a sync endpoint in a threadpool, which keeps a slow query from
-stalling the event loop for everyone else.
+Sync `def` on purpose: search blocks, so Starlette runs it in a threadpool.
 """
 
 from __future__ import annotations

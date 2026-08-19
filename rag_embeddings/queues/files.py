@@ -1,28 +1,7 @@
 """
-A queue made of directories. One JSON file per message.
-
-This is the backend that makes the fan-out real without a broker: a shared
-volume and `os.rename` are enough to hand a message to exactly one of N
-containers. Rename within a filesystem is atomic and fails with ENOENT if
-someone else got there first, so the claim needs no lock, no coordinator and no
-daemon — the losing worker just tries the next file.
-
-    <root>/<name>/ready/     waiting to be claimed, oldest name first
-    <root>/<name>/inflight/  claimed; mtime is the claim time
-    <root>/<name>/dead/      out of attempts, kept for a human
-    <root>/<name>/tmp/       partial writes, never visible to a consumer
-
-A worker that is killed leaves its message in `inflight`. Nothing rescues it
-directly; the next `receive` on any worker reaps claims older than the
-visibility timeout and puts them back. That is the same mechanic SQS uses, and
-having it here means the retry path gets exercised locally rather than
-discovered in a cluster.
-
-The caveats are the ones you would expect of a filesystem queue, and they are
-why this is the development backend and not the production one: `ready` is
-scanned per receive, so a very deep queue gets slow, and the claim is only
-atomic on a filesystem with atomic rename (fine on a local volume or EBS,
-unreliable on NFS with some mount options).
+A queue made of directories: one JSON file per message, claimed by atomic
+rename between ready/, inflight/, dead/ and tmp/ slots. Requires a filesystem
+with atomic rename; scans ready/ per receive, so deep queues get slow.
 """
 
 from __future__ import annotations
@@ -147,7 +126,7 @@ class FileQueue(Queue):
         ]
 
     def purge(self) -> None:
-        """Empty every slot. For a test fixture or a botched enqueue."""
+        """Empty every slot."""
         for slot in SLOTS:
             for path in (self.root / slot).iterdir():
                 path.unlink(missing_ok=True)
@@ -165,13 +144,7 @@ class FileQueue(Queue):
             return None
 
     def _reap(self) -> None:
-        """Put timed-out claims back. Any worker's receive does this for all.
-
-        Rename first, then bump the count: if this process dies between the
-        two, the message is visible again with a stale attempt count, which
-        costs an extra retry. The other order could duplicate the message, and
-        an undercounted attempt is the cheaper mistake.
-        """
+        """Make claims older than the visibility timeout visible again."""
         cutoff = time.time() - self.visibility_timeout
         for claimed in (self.root / "inflight").iterdir():
             if claimed.suffix != ".json":

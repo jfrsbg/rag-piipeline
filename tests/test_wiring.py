@@ -1,13 +1,7 @@
 """
-Wiring check for the pipeline, with the heavy dependencies stubbed out.
-
-Covers producer -> to-parse -> cache -> to-index -> SQL: import paths, CLI
-flags, the manifest round-trip between the two processes, the statement order
-inside the transaction, and what a stop signal does to work in flight. Runs in
-under a second and needs neither torch nor a database, which is the point — it
-is the test you can run on every edit.
-
-    python tests/test_wiring.py
+Wiring check for producer -> to-parse -> cache -> to-index -> SQL, with the
+heavy dependencies stubbed out: import paths, CLI flags, the manifest
+round-trip, statement order, and what a stop signal does to work in flight.
 """
 
 import json
@@ -214,17 +208,7 @@ from rag_embeddings.workers.parse_worker import main as parse_main   # noqa: E40
 
 
 def check(work: Path) -> None:
-    """The pipeline driven through its entrypoints, as compose starts them.
-
-    Every process here is started from argv rather than by calling a function,
-    so this covers the flags and the console scripts too.
-
-    Step 1 is invoked the way the dispatcher invokes it — `--uri` per document,
-    one process each, exiting when that document is done. Step 2 is still a
-    service, and `--idle-timeout 0` is the only difference from a running
-    deployment: it exits when its queue is empty instead of blocking on it,
-    which is what lets one process run everything here in sequence.
-    """
+    """The pipeline driven from argv, so the flags and console scripts count too."""
     inbox, cache, queue_root = work / "inbox", work / "cache", work / "queue"
     inbox.mkdir()
     (inbox / "report.pdf").write_bytes(b"%PDF-1.4 fake bytes")
@@ -322,11 +306,7 @@ def check(work: Path) -> None:
 
 
 def check_workers(work: Path) -> None:
-    """The same two steps over a queue: producer -> parse -> index -> SQL.
-
-    Runs both workers in this process against a file-backed queue, which is
-    the arrangement compose uses — only the container boundary is missing.
-    """
+    """The same two steps as workers over a file-backed queue, in this process."""
     inbox, cache, queue_root = work / "inbox", work / "cache", work / "queue"
     inbox.mkdir()
     for i in range(3):
@@ -402,16 +382,7 @@ def check_workers(work: Path) -> None:
 
 
 def check_shutdown(work: Path) -> None:
-    """Stopping a consumer must not cost the document it was working on.
-
-    The signal is only allowed to take effect between messages. Anything else
-    abandons a claimed message for the visibility timeout to reclaim, which
-    turns every deploy into a stall on whatever was in flight.
-
-    Driven through `Queue.consume` with a parse job as the handler: the loop is
-    the queue's now, and it is the same one the index worker runs. The
-    dispatcher's own loop keeps this property separately — see test_dispatch.
-    """
+    """A stop takes effect only between messages, so nothing in flight is lost."""
     inbox, cache, queue_root = work / "inbox", work / "cache", work / "queue"
     inbox.mkdir()
     for i in range(3):

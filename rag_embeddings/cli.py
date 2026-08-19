@@ -1,9 +1,4 @@
-"""
-Argument plumbing shared by the producer and both services.
-
-Kept out of their modules so that each file is about what that process does,
-and so the flags cannot drift apart between them.
-"""
+"""Argument plumbing shared by the producer and both services."""
 
 from __future__ import annotations
 
@@ -97,12 +92,7 @@ def add_worker_args(parser: argparse.ArgumentParser) -> None:
 
 
 def add_document_args(parser: argparse.ArgumentParser) -> None:
-    """One document, named on the command line: the parse worker's job mode.
-
-    These are the arguments `dispatcher.task_argv` writes, and the only reason
-    they exist. Given `--uri` the worker parses that document and exits;
-    without it, it falls back to consuming `to-parse` as a service.
-    """
+    """One document, named on the command line: the parse worker's job mode."""
     group = parser.add_argument_group("one document (job mode)")
     group.add_argument(
         "--uri",
@@ -120,11 +110,7 @@ def add_document_args(parser: argparse.ArgumentParser) -> None:
 
 
 def document_body_from(args: argparse.Namespace) -> dict | None:
-    """The message body the worker was handed, from argv or the environment.
-
-    `None` means it was handed nothing and should run as a service. The flags
-    win over the environment, as everywhere else here.
-    """
+    """The message body the worker was handed, or None to run as a service."""
     if getattr(args, "uri", None):
         return {
             "uri": args.uri,
@@ -203,7 +189,7 @@ def settings_from(args: argparse.Namespace) -> Settings:
 
 
 def dispatch_settings_from(args: argparse.Namespace) -> DispatchSettings:
-    """The dispatch half of the flags. Same rule: `None` means "not passed"."""
+    """Build dispatch settings from the flags; `None` means "not passed"."""
     command = getattr(args, "task_command", None)
     return DispatchSettings.from_env(
         runner_url=(

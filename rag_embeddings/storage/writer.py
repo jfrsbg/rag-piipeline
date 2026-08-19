@@ -18,11 +18,9 @@ def write_all(
     tables: list[dict] | None,
     chunks: list[dict] | None,
 ) -> int:
-    """Both branches in one commit. Otherwise a failure between them leaves a
-    document with vectors but no rows, and nothing knows it is half-ingested.
+    """Upsert the document and write both branches in one commit.
 
-    A branch passed as None is left untouched; passing an empty list still
-    clears the existing rows, which is what a document with no tables means.
+    A branch passed as None is left untouched; an empty list clears its rows.
     """
     with conn.transaction():
         cur = conn.cursor()

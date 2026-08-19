@@ -1,29 +1,7 @@
 """
-Runners, and the one function that chooses between them.
-
-    from rag_embeddings.runners import open_runner
-    runner = open_runner("docker://?volume=/cache:/cache&network=rag_default")
-
-The url is the only place a backend is named — the same arrangement `queues`
-uses, and for the same reason: the dispatcher takes a Runner and does not care
-which one it got, so `RAG_RUNNER_URL=ecs://prod/parse-task?subnets=...` is the
-whole migration from a laptop to a cluster.
-
-    memory://                            record, launch nothing (--dry-run)
-    process://                           a child process on this machine
-    docker://                            a container on the local daemon
-    ecs://<cluster>/<task-definition>    an ECS task
-    k8s://<namespace>                    a Kubernetes Job
-
-Everything after `?` configures placement: which volumes a local container
-gets, which subnets a Fargate task lands in, which service account a Job runs
-as. It lives in the url rather than in a flag apiece so that the whole
-placement decision is one environment variable, and so adding a backend does
-not add five flags that mean nothing to the other four.
-
-An unknown option is an error rather than something quietly ignored: a typo in
-`RAG_RUNNER_URL` would otherwise mean containers running with no volumes and
-failing one document at a time.
+Runners, and `open_runner`, which builds one from a url:
+`memory://`, `process://`, `docker://`, `ecs://<cluster>/<task-definition>`,
+`k8s://<namespace>`, with placement configured in the query string.
 """
 
 from __future__ import annotations
@@ -85,16 +63,7 @@ class _Options:
 
 
 def open_runner(url: str, **kwargs: Any) -> Runner:
-    """Build the runner described by `url`.
-
-    Keyword arguments win over the url, which is how a test injects a fake
-    client and how a caller overrides one thing without rebuilding the string.
-
-    A new backend is a Runner subclass implementing `launch` and `status` plus
-    one branch here; the waiting, the timeout and the cancel-on-overrun it
-    inherits from `base` are already the behaviour the dispatcher was tested
-    against.
-    """
+    """Build the runner described by `url`; keyword arguments win over it."""
     parsed = urlparse(str(url))
     scheme = parsed.scheme or "docker"
     options = _Options(parsed.query)

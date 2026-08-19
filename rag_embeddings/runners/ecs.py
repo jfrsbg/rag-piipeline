@@ -1,18 +1,7 @@
 """
-ECS: one task per document, on Fargate or on EC2 capacity.
-
-The image is not in the spec here — it is in the task definition, which is the
-one thing this backend cannot override. That is not a limitation worth working
-around: on ECS the task definition is where the log driver, the execution role
-and the task role live, and a dispatcher that could swap the image out from
-under those would be a way to run arbitrary code with the parser's IAM role.
-So `TaskSpec.image` is advisory on this backend, and the command and the
-environment — the parts that name the document — are what get overridden.
-
-boto3 is imported inside the client property, not at module scope: the
-dispatcher runs on a laptop against `docker://` far more often than it runs
-against a cluster, and importing the AWS SDK to launch a local container is a
-second of startup for nothing.
+ECS: one task per document, on Fargate or EC2 capacity. `TaskSpec.image` is
+advisory — the image comes from the task definition; only the command and the
+environment are overridden. boto3 is imported lazily.
 """
 
 from __future__ import annotations
@@ -156,18 +145,13 @@ class EcsRunner(Runner):
             log.warning("ecs: stop_task failed for %s: %s", handle.label, exc)
 
     def logs(self, handle: TaskHandle, tail: int = 50) -> str | None:
-        """Not here: the task's logs are wherever its log driver put them.
-
-        Returning None rather than reaching into CloudWatch is deliberate —
-        that is a second client, a second IAM permission and a log group name
-        this runner does not know.
-        """
+        """None: the task's logs are wherever its log driver put them."""
         return None
 
     # --------------------------------------------------------------- private
 
     def run_task_kwargs(self, spec: TaskSpec) -> dict[str, Any]:
-        """The RunTask call, built where a test can assert on it without AWS."""
+        """Build the RunTask keyword arguments for `spec`."""
         override: dict[str, Any] = {
             "name": self.container,
             "environment": [

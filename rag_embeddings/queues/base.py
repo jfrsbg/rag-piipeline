@@ -1,27 +1,10 @@
 """
-The queue seam.
+Queue interface: backends supply transport, the retry loop lives here.
 
-Workers talk to this interface and never to a broker. A backend supplies
-transport — put a message somewhere, hand it to exactly one consumer, take it
-back if that consumer dies — and everything built on top of that lives here,
-once: the receive loop, acking on success, returning a failure to the queue,
-counting attempts and giving up on a message that will never succeed.
-
-That split is the whole point. Swapping the fake backend for SQS should not be
-an opportunity to get the retry semantics subtly different.
-
-The contract a backend has to honour:
-
-  * a message given out by `receive` is invisible to other consumers until it
-    is acked, nacked, or its visibility deadline passes;
-  * `ack` removes it permanently;
-  * `nack` makes it visible again with `attempts` incremented;
-  * a consumer that dies without doing either gets the message redelivered
-    once the deadline passes.
-
-Delivery is therefore at-least-once, never exactly-once, which is fine here:
-the pipeline is keyed on content hashes and every write is an upsert, so a
-redelivered document converges on the rows it already had.
+Backend contract: a received message stays invisible to other consumers until
+acked, nacked, or its visibility deadline passes; `ack` removes it, `nack`
+redelivers it with `attempts` incremented, and so does a passed deadline.
+Delivery is therefore at-least-once, never exactly-once.
 """
 
 from __future__ import annotations
@@ -41,7 +24,7 @@ DEFAULT_POLL_INTERVAL = 0.5
 
 @dataclass(frozen=True)
 class Message:
-    """One delivery. `receipt` is the backend's handle, opaque above it."""
+    """One delivery. `receipt` is the backend's opaque handle."""
 
     body: dict[str, Any]
     receipt: str
@@ -54,13 +37,7 @@ class Message:
 
     @property
     def label(self) -> str:
-        """Something short enough for a log line and specific enough to grep.
-
-        The receipt alone identifies the delivery but says nothing about the
-        document, and following one document across two queues is the reason
-        anybody reads these lines. Both message types carry a uri; only
-        IndexRequest carries a sha, so this prefers the sha and falls back.
-        """
+        """Return a short, greppable identifier for log lines."""
         sha = self.body.get("sha256")
         uri = self.body.get("uri")
         parts = [p for p in (sha[:12] if isinstance(sha, str) else None, uri) if p]
@@ -69,7 +46,7 @@ class Message:
 
 @dataclass
 class ConsumeStats:
-    """What a worker run did, so the caller can log or exit non-zero."""
+    """Tally of what one consume run did."""
 
     received: int = 0
     acked: int = 0
@@ -100,11 +77,7 @@ class Queue(ABC):
 
     @abstractmethod
     def receive(self) -> Message | None:
-        """Claim one message, or None if the queue is empty right now.
-
-        Non-blocking: the waiting lives in `consume`, so a backend with real
-        long-polling can override `poll` without reimplementing the loop.
-        """
+        """Claim one message, or None if the queue is empty. Non-blocking."""
 
     @abstractmethod
     def ack(self, message: Message) -> None:
@@ -120,10 +93,10 @@ class Queue(ABC):
 
     @abstractmethod
     def depth(self) -> int:
-        """Messages waiting. This is the number an autoscaler scales on."""
+        """Return the number of messages waiting."""
 
     def close(self) -> None:
-        """Release whatever the backend holds. Default: nothing to release."""
+        """Release whatever the backend holds. Default: nothing."""
 
     # ---------------------------------------------------------------- above
 
@@ -131,17 +104,7 @@ class Queue(ABC):
         return [self.publish(body) for body in bodies]
 
     def receive_batch(self, max_messages: int = 10) -> list[Message]:
-        """Claim up to `max_messages` at once, or fewer if the queue is thin.
-
-        The default is `receive` in a loop, which is the honest implementation
-        for a backend without a batch call. A broker that has one — SQS's
-        ReceiveMessage takes MaxNumberOfMessages up to 10 — should override
-        this: a batch is one round trip instead of ten, and on SQS it is also
-        one request instead of ten to be billed for.
-
-        Only the dispatcher uses it. A worker handles one document at a time
-        and gains nothing from claiming a second one it cannot start.
-        """
+        """Claim up to `max_messages` at once; override if the backend batches."""
         batch = []
         for _ in range(max(0, max_messages)):
             message = self.receive()
@@ -157,15 +120,7 @@ class Queue(ABC):
         interval: float = DEFAULT_POLL_INTERVAL,
         should_stop: Callable[[], bool] | None = None,
     ) -> Message | None:
-        """Receive, waiting up to `timeout` for something to arrive.
-
-        `timeout=None` waits forever, which is what a service wants; a finite
-        one is how a container drains a backlog and then exits.
-
-        `should_stop` is checked between polls, so a waiting service reacts to
-        a shutdown signal within one `interval` rather than at the end of a
-        timeout it may never reach.
-        """
+        """Receive, waiting up to `timeout` (None waits forever) for a message."""
         deadline = None if timeout is None else time.monotonic() + timeout
         while True:
             if should_stop is not None and should_stop():
@@ -188,24 +143,7 @@ class Queue(ABC):
         on_error: Callable[[Message, Exception], None] | None = None,
         should_stop: Callable[[], bool] | None = None,
     ) -> ConsumeStats:
-        """Run `handler` over messages until asked to stop.
-
-        `idle_timeout=None` never returns on its own — a service runs until it
-        is signalled. A number is how a container drains a backlog and exits,
-        which is also what makes this testable without threads.
-
-        `should_stop` is the signalled case, and is checked only between
-        messages: a shutdown arriving mid-document lets that document finish
-        and be acked, rather than abandoning a claim for the visibility timeout
-        to clean up after the next deploy.
-
-        A handler that raises sends the message back for another attempt, and
-        the attempt *before* the one that would exceed `max_attempts` is the
-        last: the message is dead-lettered instead of retried forever. A
-        document that reliably kills the parser is a poison message, and the
-        only useful thing to do with it is set it aside and keep the worker
-        alive for the rest of the backlog.
-        """
+        """Run `handler` over messages, retrying until `max_attempts` then dead-lettering."""
         stats = ConsumeStats()
 
         while max_messages is None or stats.received < max_messages:
@@ -273,11 +211,7 @@ class Queue(ABC):
         return stats
 
     def drain(self, limit: int | None = None) -> Iterator[dict[str, Any]]:
-        """Every waiting message, acked as it is yielded. For tests and REPLs.
-
-        Not for workers: a consumer that dies mid-iteration has already acked,
-        so the message is lost. `consume` is the one with the safety.
-        """
+        """Yield every waiting message, acking each as it is yielded (no retry safety)."""
         seen = 0
         while limit is None or seen < limit:
             message = self.receive()

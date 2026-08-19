@@ -1,9 +1,7 @@
-"""
-Runtime configuration.
+"""Runtime configuration.
 
-Everything that differs between a laptop and a container is read from the
-environment here, once, so no module below reaches for os.environ on its own.
-CLI flags override the environment; the environment overrides the defaults.
+The only module that reads os.environ. CLI flags override the environment;
+the environment overrides the defaults.
 """
 
 from __future__ import annotations
@@ -61,34 +59,13 @@ def _float_env(name: str) -> float | None:
 
 
 def idle_timeout_from_env() -> float | None:
-    """Seconds a worker waits on an empty queue before exiting; None is forever.
-
-    Not on `Settings`: an exit condition is per-container rather than
-    per-deployment — two replicas of the same service may legitimately disagree
-    about it, one draining while the other stays up. It is read here anyway so
-    that the rule about os.environ living in one module holds.
-
-    Unset and empty both mean forever, which is the normal case now that the
-    services are the only way work is processed, and also what
-    `${RAG_IDLE_TIMEOUT:-}` in compose expands to.
-    """
+    """Seconds a worker waits on an empty queue before exiting; None is forever."""
     raw = os.environ.get("RAG_IDLE_TIMEOUT")
     return float(raw) if raw not in (None, "") else None
 
 
 def parse_request_from_env() -> dict[str, Any] | None:
-    """The one document a dispatched container was started for, if any.
-
-    A parse worker is a job now: the dispatcher claims the message and hands
-    the container its contents, so the container never opens `to-parse` itself.
-    `None` means nothing was handed over — the caller falls back to the service
-    loop, which is still how a worker is run without a dispatcher in front.
-
-    Two spellings because `spec_builder` sends both and neither is more true
-    than the other: the whole request as JSON, and the fields apart for an
-    entrypoint that is a shell script rather than this module. JSON wins when
-    both are set, being the one that cannot lose a field it did not know about.
-    """
+    """The one document a dispatched container was started for; None to run as a service."""
     raw = os.environ.get("RAG_PARSE_REQUEST")
     if raw:
         return json.loads(raw)
@@ -106,13 +83,7 @@ def parse_request_from_env() -> dict[str, Any] | None:
 
 @dataclass(frozen=True)
 class ApiSettings:
-    """How the service is served, as opposed to what it serves.
-
-    Separate from `Settings` because none of it reaches the search path: the
-    same query against the same corpus returns the same hits whatever port
-    answered. It is here rather than in the API package only to keep the rule
-    that os.environ is read in one module.
-    """
+    """How the API is served, as opposed to what it serves."""
 
     host: str = DEFAULT_API_HOST
     port: int = DEFAULT_API_PORT
@@ -134,15 +105,7 @@ class ApiSettings:
 
 @dataclass(frozen=True)
 class DispatchSettings:
-    """How the dispatcher turns a message into a container.
-
-    Separate from `Settings` for the reason `ApiSettings` is: none of it
-    reaches the pipeline. A document parses to the same bytes whether the
-    container that parsed it was started by Docker or by Fargate, given 2 or 8
-    GB of memory, four at a time or forty. `Settings` is what the *parser*
-    needs and is passed through to the container; this is what the dispatcher
-    needs to start one.
-    """
+    """How the dispatcher turns a message into a container."""
 
     # Where tasks run. The only place a backend is named — see
     # rag_embeddings/runners/__init__.py.
@@ -277,10 +240,7 @@ class Settings:
         parse_queue: str | None = None,
         index_queue: str | None = None,
     ) -> "Settings":
-        """Build settings from the environment, with optional overrides.
-
-        Every keyword is the CLI's chance to win; `None` means "not passed".
-        """
+        """Build settings from the environment; `None` keywords mean "not passed"."""
         return cls(
             cache_dir=Path(
                 cache_dir

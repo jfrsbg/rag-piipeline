@@ -1,17 +1,7 @@
 """
-The dispatcher: unpacking, fan-out, concurrency, retries, and both entrypoints.
-
-No docker, no cluster, no AWS. The three cloud backends are covered by
-asserting on the call they *would* make — the argv, the RunTask kwargs, the Job
-manifest — because that is where the bugs are: an environment variable in the
-wrong flag, a task retrying twice because the orchestrator was also retrying.
-The behaviour that has to be right regardless of backend is exercised against
-`memory://`, and once for real against `process://`, which starts actual
-child processes and reads actual exit codes.
-
-Pure stdlib and no I/O beyond a temp directory.
-
-    python tests/test_dispatch.py
+The dispatcher: unpacking, fan-out, concurrency, retries, both entrypoints.
+Cloud backends are asserted on the call they would make; the rest runs against
+`memory://`, and once for real against `process://`.
 """
 
 import json
@@ -78,7 +68,7 @@ def dispatcher_for(queue, runner, **kwargs):
 # ------------------------------------------------------------------ unpacking
 
 def check_unpacking():
-    """One message, N documents — four shapes, because four things publish."""
+    """Every published message shape unpacks into ParseRequests."""
     single = documents_in({"uri": "inbox/a.pdf", "force": True})
     assert single == [ParseRequest(uri="inbox/a.pdf", force=True)], single
 
@@ -125,7 +115,7 @@ def check_unpacking():
 # ---------------------------------------------------------------- task specs
 
 def check_task_spec(tmp: Path):
-    """What the container is told, and that it is told it the same way twice."""
+    """The spec carries the request, the pipeline config and a unique task name."""
     settings = settings_for(tmp)
     dispatch = DispatchSettings.from_env(
         runner_url="memory://",
@@ -164,7 +154,7 @@ def check_task_spec(tmp: Path):
 
 
 def check_document_mounts(tmp: Path):
-    """The container is given the document it was told to parse, and no more."""
+    """Only the named document is mounted, at the same path either side."""
     inbox = tmp / "inbox"
     inbox.mkdir(exist_ok=True)
     doc = inbox / "Demonstrações 2T26.pdf"       # the awkward name on purpose
@@ -203,7 +193,7 @@ def check_document_mounts(tmp: Path):
 # ------------------------------------------------------------------- routing
 
 def check_open_runner(tmp: Path):
-    """The url is the only place a backend is named."""
+    """The url picks the backend, and bad urls are refused rather than ignored."""
     from rag_embeddings.runners import reset_memory as reset_runners
 
     reset_runners()
@@ -364,11 +354,7 @@ def check_fan_out(tmp: Path):
 
 
 def check_concurrency_cap(tmp: Path):
-    """A message holding a hundred documents must not start a hundred at once.
-
-    This is the whole reason unpacked documents are queued rather than launched
-    where they are found.
-    """
+    """max_in_flight caps concurrent tasks even when one message holds 50 documents."""
     reset_memory()
     queue = open_queue("memory://", "flood")
     queue.publish({"uris": [f"doc{i}.pdf" for i in range(50)]})
@@ -391,7 +377,6 @@ def check_concurrency_cap(tmp: Path):
 
 
 def check_failure_is_retried_then_parked(tmp: Path):
-    """A container that exits non-zero costs the message a retry, then a park."""
     reset_memory()
     queue = open_queue("memory://", "poison")
     queue.publish(ParseRequest(uri="inbox/bad.pdf").to_body())
@@ -414,7 +399,6 @@ def check_failure_is_retried_then_parked(tmp: Path):
 
 
 def check_launch_refused_is_not_a_lost_document(tmp: Path):
-    """An orchestrator that refuses to start a task must not cost a document."""
     reset_memory()
     queue = open_queue("memory://", "nocapacity")
     queue.publish(ParseRequest(uri="inbox/a.pdf").to_body())
@@ -451,7 +435,7 @@ def check_ack_on_launch(tmp: Path):
 
 
 def check_stop_signal_finishes_what_it_started(tmp: Path):
-    """A stop must not abandon a claimed message or an orphan container."""
+    """A stop leaves no claimed message and no orphan container behind."""
     reset_memory()
     queue = open_queue("memory://", "stopping")
     for i in range(3):
@@ -478,7 +462,7 @@ def check_stop_signal_finishes_what_it_started(tmp: Path):
 
 
 def check_timeout_kills_the_container(tmp: Path):
-    """A wedged container is killed and its document retried, not abandoned."""
+    """A wedged container is killed and its document dead-lettered, not abandoned."""
     reset_memory()
     queue = open_queue("memory://", "wedged")
     queue.publish(ParseRequest(uri="inbox/slow.pdf").to_body())
@@ -531,11 +515,7 @@ def check_real_processes(tmp: Path):
 # ------------------------------------------------------------------- lambda
 
 def check_lambda(tmp: Path, monkey_env):
-    """An SQS event in, a partial batch response out.
-
-    The response is the ack: anything not named in batchItemFailures is deleted
-    from the queue, so a document that was never dispatched must appear there.
-    """
+    """An SQS event in, a partial batch response out — the response is the only ack."""
     from rag_embeddings.runners import reset_memory as reset_runners
 
     reset_runners()
@@ -602,14 +582,7 @@ def check_lambda(tmp: Path, monkey_env):
 
 
 def check_nothing_heavy_was_imported():
-    """The dispatcher starts parsers; it must not be able to parse.
-
-    It is the smallest process in the fan-out and the one that runs as a
-    Lambda, where every dependency is a megabyte of zip and a slower cold
-    start. This module has already imported the dispatcher, both entrypoints
-    and all five backends, so if any of them reaches for a heavy import at
-    module scope rather than inside the call that needs it, this fails.
-    """
+    """No heavy import at module scope: the dispatcher also ships as a Lambda."""
     for heavy in ("docling", "torch", "psycopg", "sentence_transformers",
                   "boto3", "kubernetes"):
         assert heavy not in sys.modules, (
@@ -620,7 +593,7 @@ def check_nothing_heavy_was_imported():
 # --------------------------------------------------------------------- driver
 
 def env_setter():
-    """Set environment variables and undo them at the end of the run."""
+    """Return (apply, restore) for temporary environment changes."""
     original = dict(__import__("os").environ)
 
     def apply(values):

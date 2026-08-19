@@ -1,9 +1,6 @@
-"""
-Library entry points — same cache, three reprocessing triggers.
+"""In-process library API — same cache, three reprocessing triggers.
 
-These are the in-process API. The two containerised steps in
-`rag_embeddings.steps` are the same work cut along the parse/store seam so the
-halves can run on different machines: `ingest` is `parse` followed by `index`.
+The containerised workers do the same work cut along the parse/store seam.
 """
 
 from __future__ import annotations

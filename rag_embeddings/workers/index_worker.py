@@ -1,22 +1,7 @@
 """
-Step 2 as a service: come up, claim a sha, extract, store, repeat.
-
-The reason this is a service and not a container per document is one line of
-`Embedder.__init__` — it loads a multi-gigabyte model. Amortised over a pod's
-lifetime that is a startup cost; paid per document it is the pipeline. So the
-model and the connection are built once, before the loop, and the loop itself
-holds nothing.
-
-The same argument decides the pool sizes. Parse workers are cheap and scale
-with the backlog; these carry a resident model and a database connection, so
-there are fewer of them and the queue between the two is where the difference
-in throughput is allowed to accumulate. That backlog is the point, not a
-problem to design away.
-
-Concurrency here is bounded by Postgres, not by CPU: every replica holds a
-connection, and the HNSW index on `chunks.embedding` is a shared write
-structure that stops rewarding parallelism well before the connection limit
-does. Scale this pool on latency, and put a pooler in front of it.
+Step 2 as a service: claim a sha off `to-index`, extract, store, repeat. The
+embedding model and the connection are built once, before the loop. Concurrency
+is bounded by Postgres and the HNSW index on `chunks.embedding`, not by CPU.
 """
 
 from __future__ import annotations
@@ -53,17 +38,7 @@ def handle(
     conn,
     emb: Embedder | None,
 ) -> int:
-    """One message: one document, one transaction, one commit.
-
-    Nothing here selects work. Deciding what needs indexing is a whole-cache or
-    whole-table scan, so it belongs to the producer (`workers.enqueue`) and runs
-    once; a worker is told what to do and does that only. The Embedder is built
-    before the loop for the same reason in reverse — per call it would be the
-    pipeline's dominant cost.
-
-    The manifest comes off the message rather than off the cache, so this never
-    reads the sidecar the parse service wrote.
-    """
+    """Index the one document named by `body` in a single transaction."""
     request = IndexRequest.from_body(body)
     manifest = request.to_manifest()
     short = request.sha256[:12]
@@ -121,13 +96,7 @@ def run(
     visibility_timeout: float | None = None,
     should_stop: Callable[[], bool] | None = None,
 ) -> ConsumeStats:
-    """Consume `to-index`. Returns only when told to stop.
-
-    Everything expensive is a parameter with a lazy default, so a test injects
-    fakes and a container builds the real thing — same loop either way. As with
-    the parse service, an unset `idle_timeout` means an empty queue blocks
-    instead of ending the process.
-    """
+    """Consume `to-index`; an unset `idle_timeout` blocks rather than exiting."""
     settings = settings or Settings.from_env()
     owns_conn = conn is None
     opened: list[Queue] = []

@@ -1,9 +1,7 @@
 """
-What survives the write path being queue-only.
+Pipeline steps: `parse` resolves sources, `search` is the read path.
 
-`parse` is source resolution — the producer's half of step 1, kept apart from
-the parse itself so it costs nothing to import. `search` is the read path the
-API serves. The work is in `rag_embeddings.workers`, one document per message.
+The per-document work itself lives in `rag_embeddings.workers`.
 """
 
 from .parse import guess_mime, resolve_sources

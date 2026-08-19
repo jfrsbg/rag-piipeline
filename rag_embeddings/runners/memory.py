@@ -1,14 +1,6 @@
 """
-A runner that starts nothing and records everything.
-
-This is what `--dry-run` uses and what the dispatcher's tests run against. It
-is the runner equivalent of `queues/memory.py`: the simplest thing that
-satisfies the contract in `base`, so a failure here is a bug in the test rather
-than in the backend.
-
-It is also the honest way to answer "what would this actually launch?" — the
-argv, the environment and the resources are built by the dispatcher, not by the
-backend, so a dry run exercises every line that decides them.
+A runner that starts nothing and records everything, for `--dry-run` and for
+the dispatcher's tests.
 """
 
 from __future__ import annotations
@@ -24,16 +16,7 @@ log = logging.getLogger(__name__)
 
 
 class RecordingRunner(Runner):
-    """Records launches; reports whatever `outcome` says.
-
-    `outcome` is consulted at status time rather than at launch, so a test can
-    change its mind about a task that is already running — which is how the
-    "container died halfway" case gets covered without a container.
-
-    `polls_before_done` makes a task take a measurable amount of time without
-    any sleeping: it stays RUNNING for that many status calls. Real elapsed
-    time in a test is a flake waiting to happen.
-    """
+    """Record launches; report `outcome` after `polls_before_done` status calls."""
 
     backend = "memory"
 
@@ -62,7 +45,7 @@ class RecordingRunner(Runner):
 
     @property
     def running(self) -> int:
-        """Tasks launched and not yet cleaned up — the concurrency assertion."""
+        """Tasks launched and not yet cleaned up."""
         with self._lock:
             return len(self._specs) - len(self.cleaned)
 
@@ -124,12 +107,7 @@ _REGISTRY_LOCK = threading.Lock()
 
 
 def shared(name: str = "memory", **kwargs: Any) -> RecordingRunner:
-    """The one recording runner with this name in this interpreter.
-
-    `open_runner("memory://")` has to return the same object every call or a
-    caller could not inspect what its dispatcher launched — the same reason
-    `memory://` queues live in a registry.
-    """
+    """Return the one recording runner with this name in this interpreter."""
     with _REGISTRY_LOCK:
         runner = _REGISTRY.get(name)
         if runner is None:
@@ -138,6 +116,6 @@ def shared(name: str = "memory", **kwargs: Any) -> RecordingRunner:
 
 
 def reset() -> None:
-    """Drop every shared runner. Test isolation, nothing else."""
+    """Drop every shared runner."""
     with _REGISTRY_LOCK:
         _REGISTRY.clear()

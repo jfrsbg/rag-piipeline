@@ -1,44 +1,7 @@
 """
-The dispatcher: one message in, one container per document out.
-
-    queue -> dispatcher -> N parser containers (docker | ECS | k8s)
-
-It is the piece that lets step 1 scale with the backlog instead of with the
-deployment. A pool of parse workers is N containers whether the queue holds
-zero documents or nine hundred; a dispatcher is one small process that turns
-each document into a container and lets the orchestrator decide where it runs.
-
-It owns exactly two things — how a message becomes documents, and how many
-containers may exist at once — and delegates the rest:
-
-  * the queue owns retries, attempt counting and dead-lettering (`queues/base`);
-  * the runner owns placement and exit codes (`runners/base`);
-  * the container owns parsing, which is why the dispatcher imports nothing
-    from the pipeline and has no idea what docling is.
-
-A message may hold one document or a thousand. An S3 event notification
-arrives as a `Records` array, and a producer batching a directory has every
-reason to publish one message with a list rather than a thousand messages. So
-unpacking is a fan-out step, and the documents it produces are launched
-`max_in_flight` at a time rather than all at once — the alternative is one
-message turning into a thousand simultaneous container starts, which is a
-denial of service you inflicted on yourself.
-
-The message is acked once every document in it is accounted for. That is what
-keeps the guarantees the queue was built with: a dispatcher that dies holding a
-claim loses nothing, because the visibility timeout puts the message back and
-the whole batch is dispatched again. Re-dispatching is safe — the pipeline is
-keyed on content hashes and every write is an upsert — but it is not free, so a
-message carrying a large batch wants a visibility timeout longer than its
-documents take to parse.
-
-Two ways to run it:
-
-    rag-dispatcher                                     # a service, polling
-    rag_embeddings.workers.lambda_dispatch.handler     # an SQS-triggered Lambda
-
-Both run this loop. The Lambda entrypoint differs only in where the messages
-come from and in how a failure is reported back — see that module.
+The dispatcher: claim a message off `to-parse` and run one parser container per
+document it names, `max_in_flight` at a time. A message is acked only once every
+document in it is accounted for, so a dispatcher that dies abandons nothing.
 """
 
 from __future__ import annotations
@@ -89,23 +52,7 @@ log = logging.getLogger(__name__)
 # --------------------------------------------------------------- unpacking
 
 def documents_in(body: Mapping[str, Any]) -> list[ParseRequest]:
-    """Every document one message asks for.
-
-    Four shapes, because four things publish onto this queue and only one of
-    them is ours:
-
-        {"uri": "..."}                     one document (ParseRequest)
-        {"documents": [{...}, {...}]}      a batch the producer grouped
-        {"uris": ["...", "..."], ...}      the same, shorthand
-        {"Records": [{"s3": {...}}, ...]}  an S3 event notification
-
-    The S3 shape is here rather than in `queues/messages.py` because it is not
-    our message: it is what AWS puts on the queue when a bucket notification is
-    wired straight to it, and the dispatcher is the only thing that should have
-    to know that. Everything downstream sees a ParseRequest either way.
-
-    Anything unreadable raises, which the caller turns into a failed message.
-    """
+    """Unpack one message into every document it asks for; raise if unreadable."""
     if "Records" in body:
         return _s3_documents(body["Records"])
 
@@ -121,13 +68,7 @@ def documents_in(body: Mapping[str, Any]) -> list[ParseRequest]:
 
 
 def _s3_documents(records: Iterable[Mapping[str, Any]]) -> list[ParseRequest]:
-    """S3 event records -> `s3://bucket/key` documents.
-
-    Deletions are skipped rather than failed: a bucket notification configured
-    for `s3:*` will deliver them, and there is nothing to parse. So is the test
-    event S3 sends when the notification is first configured — failing on it
-    would dead-letter a message on the day the wiring is set up.
-    """
+    """Turn S3 event records into `s3://bucket/key` documents."""
     documents = []
     for record in records:
         event = str(record.get("eventName", ""))
@@ -157,16 +98,7 @@ PARSE_MODULE = "rag_embeddings.workers.parse_worker"
 
 
 def task_argv(request: ParseRequest) -> tuple[str, ...]:
-    """One document -> the arguments the container is started with.
-
-    The message the dispatcher consumed, spelled as flags. `parse_worker` takes
-    exactly these and parses that one document; see `cli.add_document_args`.
-
-    The same fields also ride in the environment (`spec_builder` below), and
-    both are sent on purpose: this is the readable half — the document a
-    container is parsing is in `docker ps` and in `kubectl get job -o yaml`,
-    not only in an env var someone has to go and inspect.
-    """
+    """Spell one document as the arguments the container is started with."""
     argv = ["-m", PARSE_MODULE, "--uri", request.uri]
     if request.mime:
         argv += ["--mime", request.mime]
@@ -178,31 +110,9 @@ def task_argv(request: ParseRequest) -> tuple[str, ...]:
 
 
 def document_mounts(request: ParseRequest) -> tuple[str, ...]:
-    """The one document a task may see, as `TaskSpec.mounts`.
+    """Bind-mount the one document a task may see, as `TaskSpec.mounts`.
 
-    A message names a document by uri and the container has to be able to open
-    that uri. For a local one that means a bind mount, and it is the file
-    itself rather than the directory holding it: a task is given one document
-    and mounting its inbox would hand it every other document as well.
-
-    Mounted at the same absolute path it has on this machine, which is what
-    makes the message enough on its own — no translation table between host
-    paths and container paths, and the uri stored in the manifest is the uri
-    the operator enqueued.
-
-    Nothing is mounted, and that is not a failure, when:
-
-      * the uri is remote (`s3://...`) — the worker fetches it itself, and this
-        is the whole of what changes here when that lands;
-      * the file is not on this machine — `docker run -v` would silently create
-        an empty directory at that path, which is a worse failure than the
-        clear one the worker already raises;
-      * the uri is relative — there is no absolute path to mount it at, and
-        the container's working directory is not the dispatcher's.
-
-    The last two are the operator's mistake rather than the document's, so they
-    are logged here: without the line, the only symptom is a container failing
-    with "nothing to parse" at a path that plainly exists.
+    Mounted at the path it has on this machine, so the uri needs no translation.
     """
     path = local_path(request.uri)
     if path is None:
@@ -223,29 +133,7 @@ def document_mounts(request: ParseRequest) -> tuple[str, ...]:
 def spec_builder(
     settings: Settings, dispatch: DispatchSettings
 ) -> Callable[[ParseRequest], TaskSpec]:
-    """Make the function that turns one document into one container spec.
-
-    The container is told which document it owns three ways, and all three are
-    read by the worker at the other end:
-
-        the command                        `-m ...parse_worker --uri ...`
-        RAG_PARSE_REQUEST                  the whole message, as JSON
-        RAG_DOC_URI / RAG_DOC_MIME / ...   the fields, for a shell entrypoint
-
-    The command is the one that normally does it, and `task_argv` builds it
-    from the message. A configured `--task-command` replaces it outright rather
-    than being appended to — an image with its own entrypoint is being told
-    "start like this", and it still finds the document in the environment.
-
-    Everything else in the environment is what the parser already reads from
-    it — cache directory, parser version, the queue it announces onto — passed
-    through unchanged so that a container started here and a container started
-    by compose are configured identically.
-
-    Naming the document three ways is no use if the container cannot reach it,
-    so the spec also carries the mount that puts it there — `document_mounts`
-    above, and the reason the operator does not configure an inbox volume.
-    """
+    """Make the function that turns one document into one container spec."""
 
     def build(request: ParseRequest) -> TaskSpec:
         env = {
@@ -311,11 +199,7 @@ class DispatchStats:
 
 @dataclass
 class _Batch:
-    """One claimed message and every task it expanded into.
-
-    The message cannot be acked until all of them are accounted for, so this is
-    what "accounted for" is counted in.
-    """
+    """One claimed message and every task it expanded into."""
 
     message: Message
     documents: int = 0
@@ -373,17 +257,7 @@ class Dispatcher:
         idle_timeout: float | None = None,
         should_stop: Callable[[], bool] | None = None,
     ) -> DispatchStats:
-        """Dispatch until told to stop.
-
-        `idle_timeout=None` never returns on its own — a service outlives its
-        backlog, exactly as the workers do. A number drains and exits, which is
-        what a Lambda invocation and the tests want.
-
-        A stop signal stops *claiming* work immediately and then waits for the
-        containers already started, so their messages can be acked rather than
-        abandoned for the visibility timeout. A second signal is not caught —
-        see `shutdown.py`.
-        """
+        """Dispatch until told to stop; `idle_timeout=None` never returns on its own."""
         stats = DispatchStats()
         idle_since = time.monotonic()
 
@@ -429,9 +303,7 @@ class Dispatcher:
     def _receive(self, stats: DispatchStats, max_messages: int | None) -> int:
         """Claim messages and unpack them, up to what there is room to run.
 
-        Only called with `_pending` empty. Claiming a message the dispatcher
-        has no slot for would start its visibility timer while it sits in a
-        deque, and a queue is a much better place to wait than a deque is.
+        Only called with `_pending` empty, so nothing waits on a started clock.
         """
         want = min(self.batch_size, self._free())
         if max_messages is not None:
@@ -570,11 +442,7 @@ class Dispatcher:
     def _settle(self, batch: _Batch, stats: DispatchStats) -> None:
         """Ack, retry or dead-letter a message once its documents are done.
 
-        The attempt rule is `Queue.consume`'s, deliberately to the letter: the
-        attempt before the one that would exceed `max_attempts` is the last,
-        and a message that keeps failing is parked rather than retried forever.
-        Two implementations of this rule that disagree would be a way for a
-        document to be attempted twice as often on one path as the other.
+        The attempt rule mirrors `Queue.consume`'s and must stay identical to it.
         """
         if batch.settled or batch.queued:
             return
@@ -624,12 +492,7 @@ def run(
     visibility_timeout: float | None = None,
     should_stop: Callable[[], bool] | None = None,
 ) -> DispatchStats:
-    """Dispatch `to-parse` onto containers. Returns only when told to stop.
-
-    Queue and runner can be injected, which is how the tests run a whole
-    round trip in one process against `memory://` without touching argv or the
-    environment.
-    """
+    """Dispatch `to-parse` onto containers. Returns only when told to stop."""
     settings = settings or Settings.from_env()
     dispatch = dispatch or DispatchSettings.from_env()
 

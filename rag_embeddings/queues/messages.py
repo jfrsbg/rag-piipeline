@@ -1,17 +1,6 @@
 """
-What goes on the wire.
-
-Two message types, one per queue, each a frozen dataclass with an explicit
-`from_body` — because the thing on the other end of a queue is JSON written by
-a version of this code you are no longer running. Parsing it into a dataclass
-at the edge means a rolling deploy fails on the first message with a clear
-KeyError instead of somewhere deep in the pipeline with a None.
-
-IndexRequest is a Manifest plus the branch flags, and that is deliberate: step
-2's whole reason for reading a sidecar file was that it received only a sha.
-Given a queue, the message carries what the sidecar carried, and the read goes
-away. The sidecar is still written, because the single-machine path has no
-queue to carry anything.
+Message payloads: one frozen dataclass per queue, each with an explicit
+`from_body` so a message written by an older deploy fails loudly at the edge.
 """
 
 from __future__ import annotations
@@ -30,17 +19,7 @@ LOCAL_SCHEMES = ("", "file")
 
 
 def local_path(uri: str) -> Path | None:
-    """The file a uri names on this machine, or None if it names a remote one.
-
-    One function because two things ask the question and their answers must
-    match: the dispatcher mounts what this returns into the parse container,
-    and the worker inside that container opens it. If they disagreed the
-    container would be handed a document at a path it does not look at.
-
-    None is the seam for a remote scheme. `s3://bucket/key` returns it on both
-    sides, which is exactly right for both: nothing to mount, because the
-    worker will fetch the bytes itself.
-    """
+    """Return the local file a uri names, or None if the uri is remote."""
     parsed = urlparse(uri)
     if parsed.scheme not in LOCAL_SCHEMES or parsed.netloc:
         return None
@@ -51,7 +30,7 @@ def local_path(uri: str) -> Path | None:
 
 @dataclass(frozen=True)
 class ParseRequest:
-    """Step 1's unit of work: one document, wherever its bytes are."""
+    """Step 1's unit of work: one document to parse."""
 
     uri: str
     mime: str | None = None
@@ -73,11 +52,7 @@ class ParseRequest:
 
 @dataclass(frozen=True)
 class IndexRequest:
-    """Step 2's unit of work: one cached parse, described well enough to store.
-
-    Never a list of shas and never "everything in the cache" — a worker is told
-    which document it owns. Enumerating the cache is a coordinator's job.
-    """
+    """Step 2's unit of work: one cached parse to index."""
 
     sha256: str
     uri: str
@@ -121,13 +96,7 @@ class IndexRequest:
         )
 
     def to_manifest(self) -> "Manifest":
-        """The sidecar step 2 would otherwise have read off the cache.
-
-        Imported here rather than at module scope so that publishing a message
-        does not require the parser: `cache` pulls in docling, and the producer
-        — an S3 event handler, a cron, a shell loop — has no business carrying
-        a 2 GB dependency to write a filename onto a queue.
-        """
+        """Rebuild the cache sidecar this message stands in for."""
         from ..cache import Manifest
 
         return Manifest(

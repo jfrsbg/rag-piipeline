@@ -1,14 +1,6 @@
 """
-The queue contract, run against every backend.
-
-One set of assertions, parametrised over the backends, because that is the
-claim the Strategy is making: swapping the backend does not change the
-semantics. A backend that passes this is one the workers can run on unchanged.
-
-Pure stdlib and no I/O beyond a temp directory, so it runs in well under a
-second and belongs on every edit.
-
-    python tests/test_queues.py
+The queue contract, one set of assertions run against every backend: swapping
+the backend must not change the semantics. Pure stdlib, temp directory only.
 """
 
 import sys
@@ -73,7 +65,7 @@ def check_nack_redelivers(new):
 
 
 def check_visibility_timeout(new):
-    """A worker that dies holding a claim must not strand the message."""
+    """An expired claim is reclaimed, so a dead worker strands nothing."""
     q = new("crash", visibility_timeout=0.0)
     q.publish({"n": 1})
 
@@ -114,7 +106,6 @@ def check_consume_acks_and_dead_letters(new):
 
 
 def check_failure_does_not_stop_the_worker(new):
-    """One poison document must not cost the rest of the backlog."""
     q = new("mixed")
     for i in range(4):
         q.publish({"n": i})
@@ -143,12 +134,7 @@ def check_max_messages(new):
 
 
 def check_exclusive_delivery(new):
-    """Concurrent consumers, no coordination: every message goes to exactly one.
-
-    This is the property the whole fan-out rests on. For FileQueue it is really
-    a test of the rename claim, which is why it runs with threads rather than
-    being asserted in a comment.
-    """
+    """Six concurrent consumers, no coordination: every message goes to exactly one."""
     q = new("race")
     total = 60
     for i in range(total):
@@ -185,7 +171,7 @@ CHECKS = [
 # ------------------------------------------------------------------- routing
 
 def check_open_queue(tmp: Path):
-    """The uri is the only place a backend is named."""
+    """The uri picks the backend, and an unknown scheme is refused."""
     reset_memory()
     assert isinstance(open_queue("memory://", "x"), InMemoryQueue)
     # memory:// has to be a registry or a producer and consumer in one process
@@ -212,7 +198,7 @@ def check_open_queue(tmp: Path):
 
 
 def check_message_types():
-    """Round-trip through JSON-shaped dicts, which is what a broker stores."""
+    """Requests round-trip through the JSON-shaped dicts a broker stores."""
     import json
 
     from rag_embeddings.queues import IndexRequest, ParseRequest
@@ -238,11 +224,7 @@ def check_message_types():
 
 
 def check_queues_import_without_a_parser():
-    """`import rag_embeddings.queues` must not drag docling in.
-
-    The producer is a shell loop or an S3 event handler. If publishing a
-    filename required the parser, every one of those would need the 2 GB image.
-    """
+    """Publishing must not require the parser's image, so docling stays unimported."""
     assert "docling" not in sys.modules, (
         "importing the queue package pulled in the parser"
     )

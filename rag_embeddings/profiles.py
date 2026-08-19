@@ -1,7 +1,4 @@
-"""
-Profile: tokenizer, chunker and embedder all derive from one object so a
-mismatch requires constructing two profiles, which is visible in a diff.
-"""
+"""Embedding profiles: the one object tokenizer, chunker and embedder derive from."""
 
 from __future__ import annotations
 
@@ -44,11 +41,7 @@ def resolve(
     max_tokens: int | None = None,
     headroom: int | None = None,
 ) -> EmbedProfile:
-    """Look a profile up by name, optionally overriding its sizing.
-
-    An unknown name is treated as a raw HuggingFace model id, in which case
-    `max_tokens` is mandatory: there is no safe default to fall back on.
-    """
+    """Look a profile up by name, or by HuggingFace model id with `max_tokens`."""
     profile = PROFILES.get(name)
     if profile is None:
         if max_tokens is None:

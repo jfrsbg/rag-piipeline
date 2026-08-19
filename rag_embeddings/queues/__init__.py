@@ -1,12 +1,6 @@
 """
-Queues, and the one function that chooses between them.
-
-    from rag_embeddings.queues import open_queue
-    q = open_queue("file:///queue", "to-parse")
-
-The uri is the only place a backend is named. Everything else — producer,
-both workers, the tests — takes a Queue and does not care which one it got,
-which is what makes `RAG_QUEUE_URL=sqs://...` the whole migration.
+Queue backends and `open_queue`, which picks one from a uri.
+The uri is the only place a backend is named.
 """
 
 from __future__ import annotations
@@ -29,18 +23,7 @@ DEFAULT_QUEUE_URL = "file://./queue"
 
 
 def open_queue(url: str | Path, name: str, **kwargs) -> Queue:
-    """Build the queue named `name` at `url`.
-
-    `memory://` is process-local and returns the same object for the same
-    name, so a producer and a consumer in one test see one queue. `file://`
-    and bare paths are directories, which is what lets separate containers
-    sharing a volume see one queue.
-
-    A broker backend is a Queue subclass implementing the six transport
-    methods plus one branch here; the retry and dead-letter behaviour it
-    inherits from `base` is already the behaviour the workers were tested
-    against.
-    """
+    """Build the queue named `name` at `url` (`memory://`, `file://`, or a path)."""
     if isinstance(url, Path):
         return FileQueue(url, name, **kwargs)
 

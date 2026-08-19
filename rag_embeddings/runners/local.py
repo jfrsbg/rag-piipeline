@@ -1,20 +1,7 @@
 """
-The two backends that run on this machine: Docker, and a plain subprocess.
-
-`docker://` is the one that matters — it is the same container image ECS and
-Kubernetes will run, so a document that parses here parses there. It shells out
-to the CLI rather than using the Docker SDK: the dispatcher's whole dependency
-footprint is then the standard library, which is what lets it run in a Lambda
-zip without a layer.
-
-`process://` runs the parser as a child process instead, with no image and no
-daemon. It exists because the inner loop of working on the parser is "change
-the code, dispatch a document" and rebuilding an image for that is a minute a
-try. It is not a deployment target: nothing isolates one document from the
-next, and a segfault in the parser takes the process, not a container.
-
-Neither restarts anything. A container that exits non-zero is reported as
-failed and the queue redelivers the message — see `runners/base.py`.
+The two backends that run on this machine: `docker://`, which shells out to the
+Docker CLI, and `process://`, a child process for local development only.
+Neither restarts anything; the queue redelivers instead.
 """
 
 from __future__ import annotations
@@ -45,17 +32,7 @@ CLI_TIMEOUT = 60.0
 
 
 class DockerRunner(Runner):
-    """One container per document, on the local daemon.
-
-    `volumes` and `network` are the machine's half of placement, which is why
-    they are on the runner and come from the url: the parse container needs the
-    cache and the queue directory mounted, and where those live on the host is
-    a property of this machine, not of any document.
-
-    The document itself is the other half and arrives per task, as
-    `TaskSpec.mounts` — see there. Both end up as `--volume`, the runner's
-    first so that a spec cannot quietly shadow the cache.
-    """
+    """One container per document, on the local daemon."""
 
     backend = "docker"
 
@@ -145,12 +122,7 @@ class DockerRunner(Runner):
     # --------------------------------------------------------------- private
 
     def argv(self, spec: TaskSpec) -> list[str]:
-        """The command line, built where a test can assert on it.
-
-        Separate from `launch` so the argv can be checked without a daemon —
-        an env var landing in the wrong flag is exactly the bug that only shows
-        up as "the container parsed the wrong document".
-        """
+        """Build the `docker run` command line for `spec`."""
         argv = [self.binary, "run", "--detach", "--name", spec.name]
         # Not --rm: it deletes the container the instant it exits, and the exit
         # code is the only thing the dispatcher has to go on. `cleanup` removes
@@ -195,12 +167,7 @@ class DockerRunner(Runner):
 
 
 class ProcessRunner(Runner):
-    """One child process per document. For working on the parser locally.
-
-    Output goes to a file per task rather than a pipe: nothing reads the pipe
-    until the task finishes, and a child that fills its pipe buffer blocks
-    forever waiting for a reader that is busy polling it.
-    """
+    """One child process per document, with output to a log file per task."""
 
     backend = "process"
 
@@ -297,10 +264,5 @@ class ProcessRunner(Runner):
 
 
 def default_python_command() -> list[str]:
-    """The interpreter running the dispatcher, for a `process://` default.
-
-    Not `"python"`: the dispatcher is normally started from a virtualenv whose
-    interpreter is not first on PATH, and the child has to be the same one or
-    it will not have docling.
-    """
+    """Return the interpreter running the dispatcher, not `python` on PATH."""
     return [sys.executable]

@@ -1,11 +1,7 @@
 """
-The wire contract.
+Request and response models for the search API.
 
-These mirror the dicts `steps.search` returns rather than the `chunks` table:
-what a caller gets is a ranked hit with the context needed to cite it, not a
-row. `stale` and `chunk_config` are on the hit deliberately — the profile
-mismatch this project keeps warning about has to be visible to whoever reads
-the results, not only in the service's logs.
+These mirror the dicts `steps.search` returns, not the `chunks` table.
 """
 
 from __future__ import annotations

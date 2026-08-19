@@ -1,28 +1,7 @@
-"""
-The parse cache: one JSON per content hash, plus a sidecar manifest.
+"""The parse cache: one JSON per content hash, plus a sidecar manifest.
 
-The manifest exists because the two steps run as separate processes, usually on
-separate machines. The parse service knows the uri and the mime type; the index
-service only gets a sha. Rather than making it re-derive that from the source
-(which may no longer be reachable), the parse writes it next to the cached
-document.
-
-Every function here takes a `cache_dir` that is really "a cache location": a
-Path, a uri, or a BlobStore. `open_store` normalises it, so the same call works
-against a directory on a laptop and against object storage in a cluster, and
-callers never grew a second argument for the difference. The manifest also
-travels on the queue message — see `queues.messages.IndexRequest` — so the
-index service normally never reads this sidecar; it is what the in-process
-library API (`pipeline`) and any later re-enqueue read instead.
-
-Nothing docling is imported at module scope, and that is load-bearing rather
-than tidiness. `Manifest` and `cached_shas` are all the producer wants from this
-module, and it is the smallest and most-replicated container in the fan-out;
-importing `DocumentConverter` eagerly made it pay ~3s and the whole of torch to
-put a filename on a queue. The imports therefore sit in the two functions that
-actually parse or load a document, where the process doing it has already
-decided to be a parse service. `DoclingDocument` is only a type here, so it is
-declared under TYPE_CHECKING and quoted where it appears at runtime.
+A `cache_dir` may be a Path, a uri or a BlobStore; `open_store` normalises it.
+Docling is imported lazily, to keep ~3s and torch off a producer's import path.
 """
 
 from __future__ import annotations
@@ -58,12 +37,7 @@ def manifest_key(sha: str) -> str:
 
 
 def cache_path(sha: str, cache_dir: CacheLocation) -> Path:
-    """The on-disk path of a parse. Local backends only.
-
-    Kept because a path is what the local tooling wants to print, delete or
-    stat; anything that needs to work against a remote backend goes through the
-    store instead.
-    """
+    """The on-disk path of a parse. Local backends only."""
     return _local(cache_dir).path_for(cache_key(sha))
 
 
@@ -123,15 +97,10 @@ def parse_and_cache(
     *,
     source: str | None = None,
 ) -> tuple[str, DoclingDocument]:
-    """Parse once. Write the JSON before deriving anything, so a crash in a
-    downstream branch never costs a re-parse on retry.
+    """Parse a document and cache it, or return the cached parse.
 
-    `source` is what Docling actually opens — a local path when `uri` names a
-    remote object whose bytes were staged to disk. It defaults to `uri`.
-
-    The cache-hit check is what makes a redelivered queue message cheap rather
-    than merely correct: two workers handed the same document both write, the
-    store's rename decides the winner, and the bytes are identical either way.
+    `source` is the path Docling opens when `uri` names a remote object whose
+    bytes were staged to disk.
     """
     from docling_core.types.doc import DoclingDocument
 
@@ -177,11 +146,7 @@ def drop_cached(sha: str, cache_dir: CacheLocation) -> None:
 
 
 def cached_shas(cache_dir: CacheLocation) -> list[str]:
-    """Every sha with both a parse and a manifest, in a stable order.
-
-    A whole-cache scan, which is a coordinator's job: a worker is told which
-    sha to handle and never enumerates.
-    """
+    """Every sha with both a parse and a manifest, in a stable order."""
     store = open_store(cache_dir)
     manifests = {k[: -len(".meta.json")] for k in store.keys(".meta.json")}
     return sorted(

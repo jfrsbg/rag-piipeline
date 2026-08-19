@@ -1,18 +1,7 @@
-"""
-Where the parse cache lives.
+"""Where the parse cache lives — the backend is a deployment choice.
 
-Step 1 writes a parse and step 2 reads it, and once those are separate
-containers the bind mount that made that work stops being an answer. So every
-touch of the cache goes through a BlobStore and the deployment chooses the
-backend: a shared directory on one machine, object storage once the workers no
-longer share a filesystem.
-
-Docling's API is path-oriented — `save_as_json` and `load_from_json` both want
-a real file — so the interface is a pair of context managers yielding a path,
-not a bytes-in/bytes-out pair. Locally the yielded path *is* the cache file and
-nothing is copied; a remote backend stages a temp file and transfers around the
-yield. Making the local case pay a copy to satisfy the remote one would be the
-wrong trade: the local case is every test run and every laptop.
+The interface yields local paths rather than bytes because Docling's
+`save_as_json`/`load_from_json` want real files.
 """
 
 from __future__ import annotations
@@ -54,15 +43,11 @@ class BlobStore(ABC):
     @abstractmethod
     @contextmanager
     def writing(self, key: str) -> Iterator[Path]:
-        """A local path to write `key` into; stored when the block exits.
-
-        A block that raises stores nothing, so a crashed parse never leaves a
-        half-written entry that the next run would treat as a cache hit.
-        """
+        """A local path to write `key` into; stored on clean exit, dropped on error."""
 
 
 class LocalBlobStore(BlobStore):
-    """A directory. The yielded paths are the real files, so there is no copy."""
+    """A directory. The yielded paths are the real files, so nothing is copied."""
 
     def __init__(self, root: Path | str):
         self.root = Path(root)
@@ -120,12 +105,7 @@ class LocalBlobStore(BlobStore):
 
 
 def _atomic_write(path: Path, data: bytes) -> None:
-    """Write via a sibling temp file, so a reader never sees a partial file.
-
-    Two workers handed the same document race here, and both are writing the
-    same bytes — the rename decides which one wins and the loser's copy is
-    discarded whole. That is the property worth having: never a torn file.
-    """
+    """Write via a sibling temp file, so a reader never sees a partial file."""
     fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.")
     try:
         with os.fdopen(fd, "wb") as fh:
@@ -137,16 +117,7 @@ def _atomic_write(path: Path, data: bytes) -> None:
 
 
 def open_store(target: BlobStore | Path | str) -> BlobStore:
-    """Resolve a cache location to a store.
-
-    A BlobStore passes through, which is what lets callers keep taking a plain
-    directory while a worker injects something else. Plain paths and `file://`
-    are local; the scheme is where a remote backend hooks in.
-
-    Adding S3 is a class implementing the five primitives plus the two context
-    managers (download to a NamedTemporaryFile in `reading`, upload after the
-    yield in `writing`) and one more branch here. Nothing above this changes.
-    """
+    """Resolve a cache location — a store, a Path, or a uri — to a store."""
     if isinstance(target, BlobStore):
         return target
     if isinstance(target, Path):

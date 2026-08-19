@@ -1,33 +1,7 @@
 """
-Step 1 as a job: parse the one document you were given, cache it, announce it
-on `to-index`, exit.
-
-    python -m rag_embeddings.workers.parse_worker --uri inbox/a.pdf
-
-That is the whole life of a parse container, and the dispatcher is what starts
-it — the arguments above are what `dispatcher.task_argv` writes from the
-message it claimed. The same document can arrive as RAG_PARSE_REQUEST in the
-environment instead, for an image whose entrypoint is a shell script rather
-than this module; either way it is the body of the message a producer
-published, unchanged.
-
-It does not read a queue. That is the point of the shape: the dispatcher has
-already claimed the message on this container's behalf, so a worker that also
-consumed would be a second, uncoordinated consumer of `to-parse` — two
-processes racing for the same document, one of them holding a claim nobody will
-ack. The only queue opened here is `to-index`, and only to publish onto it.
-
-It does not retry, either. The exit code is the whole report: zero and the
-dispatcher acks the message, non-zero and it nacks, and the queue's existing
-attempt counting and dead-lettering do the rest. One retry rule, in one place.
-
-Still no database and still no embedding model — this scales on CPU, and how
-many run at once is the dispatcher's `--max-in-flight` rather than a replica
-count in a deployment.
-
-A parsed document is announced on `to-index` *after* the parse is stored, never
-before: the downstream worker may be running on another node and will look for
-the parse the instant it sees the message.
+Step 1 as a job: parse the one document named by --uri or RAG_PARSE_REQUEST,
+cache it, announce it on `to-index`, exit. It never consumes `to-parse` — the
+dispatcher holds that claim — and the exit code is the whole failure report.
 """
 
 from __future__ import annotations
@@ -54,17 +28,7 @@ log = logging.getLogger(__name__)
 
 
 def fetch(uri: str) -> tuple[bytes, str]:
-    """The bytes behind a uri, and a local path Docling can open.
-
-    Local paths are the only scheme wired up, and `local_path` is the same
-    function the dispatcher asked before deciding what to mount — so a uri that
-    gets a path here is a uri whose file was mounted in, at this exact path.
-
-    An `s3://` branch belongs in the None case — download to a temp file,
-    return its path — and it is the only place in the worker that would need to
-    change: everything downstream already works from bytes plus a staging path,
-    and the dispatcher already mounts nothing for a remote uri.
-    """
+    """Return the bytes behind a uri and a local path Docling can open."""
     path = local_path(uri)
     if path is None:
         raise NotImplementedError(
@@ -113,22 +77,7 @@ def run(
     *,
     index_queue: Queue | None = None,
 ) -> str:
-    """One document, then done. The dispatched container's whole life.
-
-    `body` is the message a producer published, exactly as it came off the
-    queue — the dispatcher passes it through rather than interpreting it, so
-    this is the same dict the old service loop was handed by `Queue.consume`.
-
-    Only `to-index` is opened, and only to publish: the message that named this
-    document is held by the dispatcher, which acks it when this process exits
-    zero and lets the queue redeliver it when it does not. So there is no ack
-    here, no attempt counting and no dead-lettering — the retry rule stays in
-    one place, and it is the queue's.
-
-    Raising is how a failure is reported. `main` turns it into a non-zero exit,
-    which is the only thing the runner above can see. The queue can be injected,
-    which is how the tests run a round trip against `memory://`.
-    """
+    """Parse the one document in `body` and return its sha; raise on failure."""
     settings = settings or Settings.from_env()
     opened = None
     if index_queue is None:

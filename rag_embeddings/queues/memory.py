@@ -1,13 +1,6 @@
 """
-In-process queue. One interpreter, no durability, no cleanup.
-
-This is the backend for tests and for a single-process run that wants the
-worker code path without a broker. It is deliberately the simplest thing that
-satisfies the contract in `base`, so a test failure here is a bug in the test,
-not in the queue.
-
-Threads share it safely; processes do not see each other at all. The moment you
-want two containers, use FileQueue.
+In-process queue for tests and single-process runs. No durability.
+Thread-safe; invisible to other processes — use FileQueue for those.
 """
 
 from __future__ import annotations
@@ -80,7 +73,7 @@ class InMemoryQueue(Queue):
 
     @property
     def dead(self) -> list[tuple[dict[str, Any], str]]:
-        """Dead-lettered messages with the reason each one was parked."""
+        """Dead-lettered messages paired with their reasons."""
         with self._lock:
             return list(self._dead)
 
@@ -90,7 +83,7 @@ class InMemoryQueue(Queue):
             return len(self._inflight)
 
     def _reap(self) -> None:
-        """Return claims whose deadline passed. Caller holds the lock."""
+        """Requeue claims whose deadline passed. Caller holds the lock."""
         now = time.monotonic()
         expired = [
             receipt
@@ -107,12 +100,7 @@ _REGISTRY_LOCK = threading.Lock()
 
 
 def shared(name: str, **kwargs: Any) -> InMemoryQueue:
-    """The one queue with this name in this interpreter.
-
-    `open_queue("memory://", "to-parse")` has to return the same object every
-    call or a producer and a consumer in one process would talk past each
-    other. Directories give FileQueue that for free; memory needs a registry.
-    """
+    """Return the one queue with this name in this interpreter."""
     with _REGISTRY_LOCK:
         queue = _REGISTRY.get(name)
         if queue is None:
@@ -121,6 +109,6 @@ def shared(name: str, **kwargs: Any) -> InMemoryQueue:
 
 
 def reset() -> None:
-    """Drop every shared queue. Test isolation, nothing else."""
+    """Drop every shared queue."""
     with _REGISTRY_LOCK:
         _REGISTRY.clear()

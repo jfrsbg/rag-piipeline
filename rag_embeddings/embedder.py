@@ -47,12 +47,7 @@ class Embedder:
         return self.tokenizer.count_tokens(text)
 
     def _batches(self, counts: list[int]) -> list[list[int]]:
-        """Group indices into batches that each fit the token budget.
-
-        Longest first, so a batch's padded width is fixed by its first member
-        and the greedy fill never has to reopen a decision. A sequence that
-        blows the budget on its own still goes out, alone, rather than never.
-        """
+        """Group indices, longest first, into batches that fit the token budget."""
         order = sorted(range(len(counts)), key=counts.__getitem__, reverse=True)
 
         batches: list[list[int]] = []
